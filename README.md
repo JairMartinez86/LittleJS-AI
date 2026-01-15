@@ -2,7 +2,7 @@
 
 [LittleJS](https://github.com/KilledByAPixel/LittleJS) is a fast, lightweight, and fully open source HTML5 game engine designed for simplicity and performance.
 
-This repo is a library of **LittleJS + AI** experiments:
+This repo is a library of LittleJS AI experiments:
 - playable games generated or iterated with AI help
 - starter projects you can fork and remix
 - docs and prompts to improve LittleJS + AI workflows
