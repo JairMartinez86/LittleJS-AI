@@ -1,0 +1,616 @@
+<!DOCTYPE html><head>
+<title>LittleJS AI Starter Project</title>
+<meta charset=utf-8>
+</head><body style="background:#000">
+<script src="https://cdn.jsdelivr.net/npm/littlejsengine@1.17.11/dist/littlejs.js"></script>
+<script>
+'use strict';
+
+// engine settings, do not remove
+debugWatermark = false; // Hide debug watermark in corner
+showEngineVersion = false; // Hide engine version console display
+
+// AI can use this class to make sound effects
+class SoundGenerator extends Sound 
+{
+    constructor(params = {})
+    {
+        // Generative retro sound synthesis (tiny wrapper around LittleJS Sound)
+        // params: {volume, randomness, frequency, attack, sustain, release, shape, slide, deltaSlide,
+        //          pitchJump, pitchJumpTime, repeatTime, noise, bitCrush, delay}
+        const p = {
+            volume: .35,
+            randomness: 0,
+            frequency: 700,
+            attack: .01,
+            sustain: .02,
+            release: .1,
+            shape: 0,        // 0=sine,1=triangle,2=saw,3=square
+            slide: 0,
+            deltaSlide: 0,
+            pitchJump: 0,
+            pitchJumpTime: 0,
+            repeatTime: 0,
+            noise: 0,
+            bitCrush: 0,
+            delay: 0,
+            ...params,
+        };
+
+        // LittleJS Sound constructor expects an array of parameters.
+        // Keep the order consistent with the starter template.
+        super([
+            p.volume,
+            p.randomness,
+            p.frequency,
+            p.attack,
+            p.sustain,
+            p.release,
+            p.shape,
+            p.slide,
+            p.deltaSlide,
+            p.pitchJump,
+            p.pitchJumpTime,
+            p.repeatTime,
+            p.noise,
+            0,              // modulation
+            p.bitCrush,
+            p.delay,
+            1,              // sustain volume
+            0, 0, 0         // reserved
+        ]);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// SNOOD (bubble shooter) prototype
+
+// Playfield layout
+const BUBBLE_DIAM  = 1;
+const BUBBLE_R     = BUBBLE_DIAM/2;
+const SQRT3_OVER_2 = 0.8660254037844386;
+const ROW_STEP_Y   = BUBBLE_DIAM * SQRT3_OVER_2;
+
+const COLS         = 12;
+const ROWS_MAX     = 20;        // total grid storage
+const ROWS_VISIBLE = 16;        // camera framing + lose line
+const START_ROWS   = 7;
+
+const ADD_ROW_EVERY_SHOTS = 6;
+const MIN_SHOT_ANGLE = 10 * PI/180;            // radians from +X
+const MAX_SHOT_ANGLE = 170 * PI/180;
+
+// Field dimensions (account for odd-row half offset)
+const FIELD_W = COLS*BUBBLE_DIAM + BUBBLE_DIAM/2;
+const FIELD_LEFT  = -FIELD_W/2;
+const FIELD_RIGHT =  FIELD_W/2;
+const FIELD_MIN_X = FIELD_LEFT  + BUBBLE_R;
+const FIELD_MAX_X = FIELD_RIGHT - BUBBLE_R;
+
+const TOP_Y    = 8;
+const SHOOT_Y  = -8;
+const BOTTOM_Y = SHOOT_Y;
+
+// Colors (solid primitives)
+const COLORS = [
+    hsl(0.02, 1, .55),
+    hsl(0.13, 1, .55),
+    hsl(0.33, 1, .50),
+    hsl(0.58, 1, .60),
+    hsl(0.78, 1, .60),
+    hsl(0.92, 1, .60),
+];
+const OUTLINE = hsl(0,0,0,.8);
+
+// Sounds
+let sShoot, sPop, sDrop, sLose, sWin;
+
+// Game state
+let grid;
+let aimAngle;
+let projectile; // {pos, vel, colorIndex}
+let currentColorIndex, nextColorIndex;
+let score, shots, gameOver, gameWin;
+
+// Camera framing
+let fieldH;
+
+function resetGame()
+{
+    score = 0;
+    shots = 0;
+    gameOver = false;
+    gameWin = false;
+    projectile = null;
+
+    // make empty grid
+    grid = Array.from({length: ROWS_MAX}, ()=> Array.from({length: COLS}, ()=> null));
+
+    // seed starting bubbles
+    for (let r=0; r<START_ROWS; ++r)
+    {
+        for (let c=0; c<COLS; ++c)
+        {
+            // add some gaps in lower starting rows
+            const gapChance = r < 3 ? 0 : r < 5 ? .15 : .25;
+            if (rand() < gapChance) continue;
+            grid[r][c] = randInt(COLORS.length);
+        }
+    }
+
+    // setup shooter
+    aimAngle = PI/2;
+
+    // set initial queue
+    currentColorIndex = pickShootColor();
+    nextColorIndex    = pickShootColor();
+
+    fieldH = (ROWS_VISIBLE-1)*ROW_STEP_Y + (TOP_Y - SHOOT_Y) + 2;
+}
+
+function pickShootColor()
+{
+    // pick from colors currently present to avoid impossible shots
+    const present = new Set();
+    for (let r=0; r<ROWS_MAX; ++r)
+    for (let c=0; c<COLS; ++c)
+    {
+        const v = grid[r][c];
+        if (v !== null) present.add(v);
+    }
+    if (!present.size)
+        return randInt(COLORS.length);
+
+    const arr = Array.from(present);
+    return arr[randInt(arr.length)];
+}
+
+function gridToWorld(r, c)
+{
+    const xOff = (r&1) ? BUBBLE_R : 0;
+    const x = FIELD_LEFT + BUBBLE_R + xOff + c*BUBBLE_DIAM;
+    const y = TOP_Y - r*ROW_STEP_Y;
+    return vec2(x, y);
+}
+
+function worldToGrid(pos)
+{
+    // estimate row
+    let r = Math.round((TOP_Y - pos.y)/ROW_STEP_Y);
+    r = clamp(r, 0, ROWS_MAX-1);
+
+    const xOff = (r&1) ? BUBBLE_R : 0;
+    let c = Math.round((pos.x - (FIELD_LEFT + BUBBLE_R + xOff))/BUBBLE_DIAM);
+    c = clamp(c, 0, COLS-1);
+
+    return {r, c};
+}
+
+function inBounds(r,c)
+{
+    return r>=0 && r<ROWS_MAX && c>=0 && c<COLS;
+}
+
+function neighbors(r,c)
+{
+    // 6-neighbors on offset hex grid
+    const odd = r&1;
+    const list = [
+        [r, c-1],
+        [r, c+1],
+        [r-1, c + (odd?0:-1)],
+        [r-1, c + (odd?1:0)],
+        [r+1, c + (odd?0:-1)],
+        [r+1, c + (odd?1:0)],
+    ];
+    return list.filter(([rr,cc])=>inBounds(rr,cc));
+}
+
+function findNearestEmptyCell(worldPos)
+{
+    const {r: r0, c: c0} = worldToGrid(worldPos);
+
+    // if empty, easy
+    if (grid[r0][c0] === null)
+        return {r: r0, c: c0};
+
+    // search nearby ring up to distance 2
+    let best = null;
+    let bestD2 = 1e9;
+
+    for (let dr=-2; dr<=2; ++dr)
+    for (let dc=-2; dc<=2; ++dc)
+    {
+        const r = r0 + dr;
+        const c = c0 + dc;
+        if (!inBounds(r,c)) continue;
+        if (grid[r][c] !== null) continue;
+
+        const p = gridToWorld(r,c);
+        const d2 = p.distanceSquared(worldPos);
+        if (d2 < bestD2)
+            bestD2 = d2, best = {r,c};
+    }
+
+    // fallback: find any empty in row range
+    if (!best)
+    {
+        for (let r=0; r<ROWS_MAX; ++r)
+        for (let c=0; c<COLS; ++c)
+            if (grid[r][c] === null)
+                return {r,c};
+    }
+
+    return best;
+}
+
+function bfsClusterSameColor(rStart, cStart)
+{
+    const color = grid[rStart][cStart];
+    if (color === null) return [];
+
+    const key = (r,c)=> r + ',' + c;
+    const q = [[rStart, cStart]];
+    const visited = new Set([key(rStart,cStart)]);
+    const out = [];
+
+    while (q.length)
+    {
+        const [r,c] = q.pop();
+        out.push([r,c]);
+        for (const [rr,cc] of neighbors(r,c))
+        {
+            const k = key(rr,cc);
+            if (visited.has(k)) continue;
+            if (grid[rr][cc] !== color) continue;
+            visited.add(k);
+            q.push([rr,cc]);
+        }
+    }
+    return out;
+}
+
+function removeCells(cells)
+{
+    for (const [r,c] of cells)
+        grid[r][c] = null;
+}
+
+function dropFloating()
+{
+    // mark all bubbles connected to top
+    const key = (r,c)=> r + ',' + c;
+    const q = [];
+    const anchored = new Set();
+
+    for (let c=0; c<COLS; ++c)
+        if (grid[0][c] !== null)
+            q.push([0,c]), anchored.add(key(0,c));
+
+    while (q.length)
+    {
+        const [r,c] = q.pop();
+        for (const [rr,cc] of neighbors(r,c))
+        {
+            if (grid[rr][cc] === null) continue;
+            const k = key(rr,cc);
+            if (anchored.has(k)) continue;
+            anchored.add(k);
+            q.push([rr,cc]);
+        }
+    }
+
+    // remove everything not anchored
+    let dropped = 0;
+    for (let r=0; r<ROWS_MAX; ++r)
+    for (let c=0; c<COLS; ++c)
+    {
+        if (grid[r][c] === null) continue;
+        if (!anchored.has(key(r,c)))
+            grid[r][c] = null, dropped++;
+    }
+
+    if (dropped)
+    {
+        score += dropped * 5;
+        sDrop.play();
+    }
+}
+
+function resolveAfterPlacement(r, c)
+{
+    // match-3 pop
+    const cluster = bfsClusterSameColor(r,c);
+    if (cluster.length >= 3)
+    {
+        removeCells(cluster);
+        score += cluster.length * 10;
+        sPop.play();
+        dropFloating();
+    }
+
+    // win check
+    let any = false;
+    for (let rr=0; rr<ROWS_MAX && !any; ++rr)
+    for (let cc=0; cc<COLS && !any; ++cc)
+        any = grid[rr][cc] !== null;
+
+    if (!any)
+    {
+        gameWin = true;
+        gameOver = true;
+        sWin.play();
+    }
+}
+
+function addRow()
+{
+    // push down
+    for (let r=ROWS_MAX-1; r>0; --r)
+        for (let c=0; c<COLS; ++c)
+            grid[r][c] = grid[r-1][c];
+
+    // new top row (use colors present + allow full palette)
+    for (let c=0; c<COLS; ++c)
+        grid[0][c] = rand() < .12 ? null : randInt(COLORS.length);
+
+    // lose check (too low)
+    const loseRow = ROWS_VISIBLE-1;
+    for (let c=0; c<COLS; ++c)
+        if (grid[loseRow]?.[c] !== null)
+            return triggerLose();
+}
+
+function triggerLose()
+{
+    if (gameOver) return;
+    gameOver = true;
+    gameWin = false;
+    sLose.play();
+}
+
+function shoot()
+{
+    if (gameOver || projectile) return;
+
+    // shoot in the current aim direction (aimAngle is continuously updated from mouse)
+    const shooterPos = vec2(0, SHOOT_Y);
+    const dir = vec2(Math.cos(aimAngle), Math.sin(aimAngle));
+
+    projectile = {
+        pos: shooterPos.copy(),
+        vel: dir.scale(26),
+        colorIndex: currentColorIndex,
+    };
+
+    // rotate queue
+    currentColorIndex = nextColorIndex;
+    nextColorIndex = pickShootColor();
+
+    shots++;
+    if (shots % ADD_ROW_EVERY_SHOTS === 0)
+        addRow();
+
+    sShoot.play();
+}
+
+function integrateProjectile()
+{
+    if (!projectile) return;
+
+    // move
+    projectile.pos = projectile.pos.add(projectile.vel.scale(timeDelta));
+
+    // bounce walls
+    if (projectile.pos.x < FIELD_MIN_X)
+    {
+        projectile.pos.x = FIELD_MIN_X;
+        projectile.vel.x = Math.abs(projectile.vel.x);
+    }
+    if (projectile.pos.x > FIELD_MAX_X)
+    {
+        projectile.pos.x = FIELD_MAX_X;
+        projectile.vel.x = -Math.abs(projectile.vel.x);
+    }
+
+    // hit top
+    if (projectile.pos.y > TOP_Y)
+    {
+        placeProjectile(projectile.pos);
+        return;
+    }
+
+    // collide with existing bubbles
+    const hitR2 = (BUBBLE_DIAM * .96) ** 2;
+    for (let r=0; r<ROWS_MAX; ++r)
+    for (let c=0; c<COLS; ++c)
+    {
+        const v = grid[r][c];
+        if (v === null) continue;
+        const p = gridToWorld(r,c);
+        if (p.distanceSquared(projectile.pos) < hitR2)
+        {
+            // place near the impact point
+            placeProjectile(projectile.pos);
+            return;
+        }
+    }
+
+    // fell below shooter (shouldn't happen, but safety)
+    if (projectile.pos.y < SHOOT_Y - 2)
+        projectile = null;
+}
+
+function placeProjectile(worldPos)
+{
+    const cell = findNearestEmptyCell(worldPos);
+    if (!cell)
+        return triggerLose();
+
+    const {r,c} = cell;
+    grid[r][c] = projectile.colorIndex;
+    projectile = null;
+
+    // if bubble placed too low, lose
+    if (r >= ROWS_VISIBLE-1)
+        return triggerLose();
+
+    resolveAfterPlacement(r,c);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameInit()
+{
+    // called once after the engine starts up
+    setCanvasMaxSize(vec2(1280, 720));
+    setCanvasClearColor(hsl(0,0,0));
+    setShowSplashScreen(false);
+
+    // sound
+    sShoot = new SoundGenerator({volume:.35, frequency:850, attack:.001, sustain:.01, release:.08, shape:3, slide:-.2});
+    sPop   = new SoundGenerator({volume:.45, frequency:520, attack:.001, sustain:.01, release:.10, shape:2, randomness:.05, bitCrush:.2});
+    sDrop  = new SoundGenerator({volume:.25, frequency:180, attack:.001, sustain:.02, release:.18, shape:1, slide:-.15});
+    sLose  = new SoundGenerator({volume:.5,  frequency:120, attack:.01,  sustain:.08, release:.35, shape:3, slide:-.25, noise:.06});
+    sWin   = new SoundGenerator({volume:.45, frequency:640, attack:.01,  sustain:.05, release:.25, shape:0, slide:.15, repeatTime:.08});
+
+    resetGame();
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameUpdate()
+{
+    // called every frame at 60 frames per second
+
+    // restart
+    if (keyWasPressed('KeyR'))
+        resetGame();
+
+    if (!gameOver)
+    {
+        // mouse aim (updates every frame)
+        const shooterPos = vec2(0, SHOOT_Y);
+        if (mouseInWindow)
+        {
+            let dir = mousePos.subtract(shooterPos);
+            if (dir.lengthSquared() < .001)
+                dir = vec2(0, 1);
+
+            const ang = Math.atan2(dir.y, dir.x);
+            aimAngle = clamp(ang, MIN_SHOT_ANGLE, MAX_SHOT_ANGLE);
+        }
+
+        // mouse shoot only
+        if (mouseWasPressed(0))
+            shoot();
+
+        integrateProjectile();
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameUpdatePost()
+{
+    // called after physics and objects are updated
+    // setup camera and prepare for render
+
+    // frame the whole field nicely
+    const pad = 2.5;
+    const worldW = FIELD_W + pad;
+    const worldH = (TOP_Y - SHOOT_Y) + pad + ROW_STEP_Y*(ROWS_VISIBLE-1);
+    cameraScale = min(mainCanvasSize.x/worldW, mainCanvasSize.y/worldH);
+    cameraPos = vec2(0, (TOP_Y + SHOOT_Y)/2 + 1.2);
+    cameraAngle = 0;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameRender()
+{
+    // called before objects are rendered
+
+    // background panel
+    const panelPos = vec2(0, (TOP_Y + SHOOT_Y)/2 + 1.2);
+    const panelSize = vec2(FIELD_W + 1.2, (TOP_Y - SHOOT_Y) + ROW_STEP_Y*(ROWS_VISIBLE-1) + 1.2);
+    drawRect(panelPos, panelSize, hsl(0,0,.08));
+
+    // walls
+    const wallTop = TOP_Y + 1;
+    const wallBot = SHOOT_Y - 1;
+    drawLine(vec2(FIELD_LEFT, wallBot), vec2(FIELD_LEFT, wallTop), .08, hsl(0,0,.18));
+    drawLine(vec2(FIELD_RIGHT, wallBot), vec2(FIELD_RIGHT, wallTop), .08, hsl(0,0,.18));
+    drawLine(vec2(FIELD_LEFT, TOP_Y), vec2(FIELD_RIGHT, TOP_Y), .08, hsl(0,0,.18));
+
+    // lose line indicator
+    const loseY = TOP_Y - (ROWS_VISIBLE-1)*ROW_STEP_Y;
+    drawLine(vec2(FIELD_LEFT, loseY), vec2(FIELD_RIGHT, loseY), .06, hsl(0,1,.45,.4));
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameRenderPost()
+{
+    // draw bubbles
+    for (let r=0; r<ROWS_MAX; ++r)
+    for (let c=0; c<COLS; ++c)
+    {
+        const v = grid[r][c];
+        if (v === null) continue;
+        const p = gridToWorld(r,c);
+        drawCircle(p, BUBBLE_DIAM, COLORS[v], .06, OUTLINE);
+        // tiny highlight
+        drawCircle(p.add(vec2(-.12,.12)), .22, hsl(0,0,1,.18));
+    }
+
+    // projectile
+    if (projectile)
+    {
+        drawCircle(projectile.pos, BUBBLE_DIAM, COLORS[projectile.colorIndex], .06, OUTLINE);
+        drawCircle(projectile.pos.add(vec2(-.12,.12)), .22, hsl(0,0,1,.18));
+    }
+
+    // shooter + aim line
+    const shooterPos = vec2(0, SHOOT_Y);
+    const dir = vec2(Math.cos(aimAngle), Math.sin(aimAngle));
+    const aimEnd = shooterPos.add(dir.scale(6));
+    drawLine(shooterPos, aimEnd, .08, hsl(0,0,1,.25));
+    drawCircle(shooterPos, BUBBLE_DIAM, COLORS[currentColorIndex], .06, OUTLINE);
+
+    // next bubble preview
+    const nextPos = shooterPos.add(vec2(2.1, -0.2));
+    drawCircle(nextPos, .7, COLORS[nextColorIndex], .05, OUTLINE);
+
+    // UI (screen space)
+    drawTextScreen(
+        `Score ${score}   Shots ${shots}
+Move Mouse: Aim   Click: Shoot   R: Restart`,
+        vec2(mainCanvasSize.x/2, 34),
+        28,
+        hsl(0,0,1),
+        4,
+        hsl(0,0,0)
+    );
+
+    if (gameOver)
+    {
+        drawTextScreen(
+            gameWin ? 'YOU WIN!' : 'GAME OVER',
+            vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 - 20),
+            90,
+            gameWin ? hsl(.33,1,.6) : hsl(0,1,.6),
+            10,
+            hsl(0,0,0)
+        );
+        drawTextScreen(
+            'Press R to restart',
+            vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 + 60),
+            40,
+            hsl(0,0,1),
+            6,
+            hsl(0,0,0)
+        );
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Startup LittleJS Engine
+engineInit(gameInit, gameUpdate, gameUpdatePost, gameRender, gameRenderPost);
+
+</script>

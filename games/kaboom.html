@@ -1,0 +1,603 @@
+<!DOCTYPE html><head>
+<title>LittleJS AI Starter Project</title>
+<meta charset=utf-8>
+</head><body>
+<script src="https://cdn.jsdelivr.net/npm/littlejsengine@1.17.11/dist/littlejs.js"></script>
+<script>
+'use strict';
+
+// engine settings
+debugWatermark = false; // Hide debug watermark in corner
+showEngineVersion = false; // Hide engine version console display
+
+// AI can use this class to make sound effects
+class SoundGenerator extends Sound 
+{
+    constructor(params = {})
+    {
+        const {
+            volume = 1,        // Volume scale (percent)
+            randomness = .05,  // How much to randomize frequency (percent Hz)
+            frequency = 220,   // Frequency of sound (Hz)
+            attack = 0,        // Attack time, how fast sound starts (seconds)
+            release = .1,      // Release time, how fast sound fades out (seconds)
+            shapeCurve = 1,    // Squarenes of wave (0=square, 1=normal, 2=pointy)
+            slide = 0,         // How much to slide frequency (kHz/s)
+            pitchJump = 0,     // Frequency of pitch jump (Hz)
+            pitchJumpTime = 0, // Time of pitch jump (seconds)
+            repeatTime = 0,    // Resets some parameters periodically (seconds)
+            noise = 0,         // How much random noise to add (percent)
+            bitCrush = 0,      // Resamples at a lower frequency in (samples*100)
+            delay = 0,         // Overlap sound with itself for reverb and flanger effects (seconds)
+        } = params;
+        
+        super([volume, randomness, frequency, attack, 0, release, shapeCurve, slide, pitchJump, pitchJumpTime, repeatTime, noise, 0, bitCrush, delay, 1, 0, 0, 0]);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Kaboom! (Atari-style) - LittleJS prototype (no assets, primitives only)
+
+const FIXED_SIZE = vec2(960, 720);        // 4:3-ish retro canvas
+const PLAY_W = 900;
+const PLAY_H = 650;
+
+const TOP_Y    =  PLAY_H/2 - 70;
+const FLOOR_Y  = -PLAY_H/2 + 50;
+const BUCKET_Y =  FLOOR_Y + 20;
+
+// Building (Kaboom-style backdrop)
+const BUILDING_W = 720;
+const BUILDING_BOTTOM = FLOOR_Y - 6;
+const BUILDING_TOP = TOP_Y - 42;          // roof line (bomber stands on this)
+const BUILDING_Y = (BUILDING_TOP + BUILDING_BOTTOM) / 2;
+const BUILDING_H = (BUILDING_TOP - BUILDING_BOTTOM);
+
+const BOMB_RADIUS = 14;                  // collision radius-ish
+
+// juggling physics
+const BOMB_GRAVITY = -.20;               // downward accel per frame
+const BOUNCE_UP_MIN = 8;                 // ensure bounce feels snappy
+const BOUNCE_FACTOR = .88;               // preserve vertical speed on bounce
+const BOUNCE_SIDE_KICK = 9;              // how much x is influenced by where you hit
+const BUCKET_VEL_KICK = .8;              // how much x is influenced by moving bucket
+
+let score, highScore, level, lives, caughtThisLife;
+let bucketX, bucketW, bucketH;
+let bucketVX = 0, bucketPrevX = 0;
+let clownX, clownTargetX, clownDir, clownDropFlash;
+let spawnTimer, missFreeze, gameOver;
+let bombs = [];
+let particles = [];
+
+let shakeFrames = 0;
+let shakeAmount = 0;
+
+let sfxBounce, sfxMiss, sfxLevelUp, sfxGameOver, sfxSafeThud;
+
+// --- helpers ---------------------------------------------------------------
+
+const clampf = (v, a, b)=> v < a ? a : v > b ? b : v;
+const randRange = (a,b)=> rand(a,b);
+
+function setBucketSizeForLives()
+{
+    // emulate Kaboom's shrinking buckets after misses
+    bucketW = lives >= 3 ? 180 : lives == 2 ? 135 : 100;
+    bucketH = 34;
+}
+
+function startShake(frames, amount)
+{
+    shakeFrames = frames|0;
+    shakeAmount = amount;
+}
+
+function spawnParticles(pos, count, baseSpeed, lifeMin, lifeMax)
+{
+    for (let i=0; i<count; ++i)
+    {
+        const a = randRange(0, PI*2);
+        const s = baseSpeed * randRange(.4, 1.1);
+        particles.push({
+            pos: pos.copy(),
+            vel: vec2(Math.cos(a)*s, Math.sin(a)*s),
+            life: randRange(lifeMin, lifeMax)|0,
+            size: randRange(6, 16),
+        });
+    }
+}
+
+function resetRound(clearBombs=true)
+{
+    // NOTE: clearBombs is intentional, but if called during the bombs loop we must break out
+    // (fixed below in gameUpdate) to avoid iterating past the new length.
+    missFreeze = 35;
+    clownDropFlash = 0;
+    if (clearBombs) bombs.length = 0;
+    startShake(14, 10);
+}
+
+function startGame()
+{
+    score = 0;
+    level = 1;
+    lives = 3;
+    caughtThisLife = 0;
+    bucketX = 0;
+    bucketPrevX = bucketX;
+    bucketVX = 0;
+    setBucketSizeForLives();
+
+    clownX = 0;
+    clownTargetX = 0;
+    clownDir = 1;
+    spawnTimer = 40;
+    missFreeze = 30;
+    gameOver = false;
+
+    bombs.length = 0;
+    particles.length = 0;
+    shakeFrames = 0;
+    shakeAmount = 0;
+}
+
+function endGame()
+{
+    gameOver = true;
+    bombs.length = 0;
+    missFreeze = 0;
+    startShake(24, 14);
+    sfxGameOver?.play(undefined, .9);
+    if (score > highScore)
+    {
+        highScore = score;
+        localStorage.setItem('kaboomHigh', String(highScore));
+    }
+}
+
+function spawnBomb()
+{
+    const fallSpeed = 5 + level * .65;        // pixels/frame
+    const side = randRange(-1.2, 1.2);
+    bombs.push({
+        pos: vec2(clownX, TOP_Y - 20),
+        vel: vec2(side, -fallSpeed),
+        r: BOMB_RADIUS,
+        bounces: 0,          // juggle count
+    });
+    clownDropFlash = 10;
+}
+
+function updateClown()
+{
+    const maxX = PLAY_W/2 - 80;
+    if (!clownTargetX || Math.abs(clownTargetX - clownX) < 8)
+        clownTargetX = randRange(-maxX, maxX);
+
+    const speed = 3 + level * .25;
+    const dx = clownTargetX - clownX;
+    clownDir = dx >= 0 ? 1 : -1;
+    clownX += clampf(dx, -speed, speed);
+}
+
+function updateBucket()
+{
+    const maxX = PLAY_W/2 - bucketW/2 - 18;
+
+    bucketPrevX = bucketX;
+
+    // Desktop: ALWAYS follow mouse (no click/hold required)
+    if (!isTouchDevice)
+    {
+        bucketX = lerp(bucketX, clampf(mousePos.x, -maxX, maxX), .35);
+    }
+    else
+    {
+        // Touch: follow finger while pressed
+        if (mouseIsDown(0))
+            bucketX = lerp(bucketX, clampf(mousePos.x, -maxX, maxX), .35);
+        else
+        {
+            // keyboard fallback (useful on some devices/emulators)
+            const left  = keyIsDown('ArrowLeft') || keyIsDown('KeyA');
+            const right = keyIsDown('ArrowRight') || keyIsDown('KeyD');
+            const speed = 10;
+            if (left)  bucketX -= speed;
+            if (right) bucketX += speed;
+            bucketX = clampf(bucketX, -maxX, maxX);
+        }
+    }
+
+    bucketVX = bucketX - bucketPrevX;
+}
+
+function maybeLevelUp()
+{
+    const newLevel = 1 + (score / 600 |0);
+    if (newLevel > level)
+    {
+        level = newLevel;
+        sfxLevelUp?.play(undefined, .45);
+        startShake(10, 6);
+    }
+}
+
+function bounceBomb(b)
+{
+    b.bounces++;
+
+    // score: first bounce is like a catch, extra bounces ramp up
+    const base = 10 * level;
+    const bonus = b.bounces > 1 ? (5 * (b.bounces - 1) * level) : 0;
+    score += base + bonus;
+
+    // a little visual reward
+    spawnParticles(b.pos, b.bounces == 1 ? 10 : 16, b.bounces == 1 ? 4.5 : 5.6, 16, 28);
+
+    // bleep rises with bounce count
+    const pitch = 1 + Math.min(1.2, b.bounces * .08) + level * .02;
+    sfxBounce?.play(undefined, .55, pitch, .25);
+
+    maybeLevelUp();
+}
+
+function missBomb(b)
+{
+    lives--;
+    sfxMiss?.play(undefined, .7);
+    spawnParticles(vec2(b.pos.x, FLOOR_Y), 22, 6.5, 18, 34);
+    startShake(18, 12);
+
+    if (lives <= 0)
+        return endGame();
+
+    setBucketSizeForLives();
+    resetRound(true);
+}
+
+function safeGroundHit(b)
+{
+    // If it has bounced at least once, it won't hurt you when it hits the ground.
+    // It just "pops" harmlessly.
+    sfxSafeThud?.play(undefined, .35, 1.0, .15);
+    spawnParticles(vec2(b.pos.x, FLOOR_Y), 14, 4.2, 14, 24);
+}
+
+function bombBucketBounceResponse(b, bucket)
+{
+    // Defensive: if something cleared the bombs array mid-frame, ignore.
+    if (!b || !b.pos || !b.vel)
+        return;
+
+    // reposition just above bucket rim
+    const top = bucket.y + bucket.h/2;
+    b.pos.y = top + b.r + 1;
+
+    // vertical bounce
+    const vy = Math.abs(b.vel.y);
+    b.vel.y = Math.max(BOUNCE_UP_MIN, vy * BOUNCE_FACTOR);
+
+    // horizontal kick based on where you hit + bucket movement
+    const rel = clampf((b.pos.x - bucket.x) / (bucket.w/2), -1, 1);
+    b.vel.x += rel * BOUNCE_SIDE_KICK + bucketVX * BUCKET_VEL_KICK;
+
+    // cap sideways speed
+    b.vel.x = clampf(b.vel.x, -18, 18);
+}
+
+// --- minimal self-tests ----------------------------------------------------
+
+function runSelfTests()
+{
+    // These are lightweight sanity checks to catch "undefined vel" style crashes.
+    const t = {pos: vec2(1,2), vel: vec2(3,4), r: 1, bounces: 0};
+    console.assert(t.vel && typeof t.vel.x == 'number' && typeof t.vel.y == 'number', 'TEST: bomb vel should exist');
+    console.assert(t.pos && typeof t.pos.x == 'number' && typeof t.pos.y == 'number', 'TEST: bomb pos should exist');
+
+    const bucket = {x:0, y:0, w:100, h:20};
+    bombBucketBounceResponse(t, bucket);
+    console.assert(typeof t.vel.x == 'number' && typeof t.vel.y == 'number', 'TEST: bounce response keeps vel numeric');
+}
+
+// --- LittleJS callbacks ----------------------------------------------------
+
+function gameInit()
+{
+    // keep startup minimal and deterministic
+    setShowSplashScreen(false);
+    setCanvasFixedSize(FIXED_SIZE);
+    setCanvasPixelated(true);
+    setFontDefault('monospace');
+
+    setCameraScale(1);
+    setCameraPos(vec2());
+
+    highScore = +(localStorage.getItem('kaboomHigh') || 0);
+
+    // sound effects (simple bleeps like the original era)
+    sfxBounce   = new SoundGenerator({frequency: 820, release: .04, volume: .85, shapeCurve: .8});
+    sfxMiss     = new SoundGenerator({frequency: 110, release: .18, volume: 1, noise: .15, shapeCurve: 0});
+    sfxSafeThud = new SoundGenerator({frequency: 160, release: .10, volume: .6, noise: .12, shapeCurve: .4});
+    sfxLevelUp  = new SoundGenerator({frequency: 500, release: .12, volume: .7, slide: 2.5});
+    sfxGameOver = new SoundGenerator({frequency: 160, release: .35, volume: .9, slide: -1.8, noise: .05});
+
+    runSelfTests();
+    startGame();
+}
+
+function gameUpdate()
+{
+    // restart
+    if (gameOver)
+    {
+        if (keyWasPressed('Space') || keyWasPressed('Enter') || mouseWasPressed(0))
+            startGame();
+        return;
+    }
+
+    // brief freeze after misses
+    if (missFreeze > 0)
+    {
+        missFreeze--;
+        updateBucket(); // allow small adjustments even while frozen
+        return;
+    }
+
+    updateBucket();
+    updateClown();
+
+    // spawn bombs faster as level rises
+    if (--spawnTimer <= 0)
+    {
+        spawnBomb();
+        const base = 55 - level * 4;
+        spawnTimer = (clampf(base, 10, 60) + randRange(0, 20)) |0;
+    }
+
+    const maxX = PLAY_W/2 - 20;
+
+    // update bombs
+    const bucket = {x: bucketX, y: BUCKET_Y, w: bucketW, h: bucketH};
+    let roundResetThisFrame = false;
+
+    for (let i=bombs.length; i--;)
+    {
+        const b = bombs[i];
+
+        // Guard against mid-loop clears (missBomb/resetRound can clear bombs).
+        if (!b || !b.pos || !b.vel)
+        {
+            bombs.splice(i, 1);
+            continue;
+        }
+
+        // integrate
+        b.vel.y += BOMB_GRAVITY;
+        b.pos.x += b.vel.x;
+        b.pos.y += b.vel.y;
+
+        // soft wall bounce to keep juggling in play
+        if (b.pos.x < -maxX)
+        {
+            b.pos.x = -maxX;
+            b.vel.x = Math.abs(b.vel.x) * .8;
+        }
+        if (b.pos.x > maxX)
+        {
+            b.pos.x = maxX;
+            b.vel.x = -Math.abs(b.vel.x) * .8;
+        }
+
+        // bucket collision: only bounce when moving downward
+        const dx = Math.abs(b.pos.x - bucket.x);
+        const dy = Math.abs(b.pos.y - bucket.y);
+        const overlap = dx < bucket.w/2 + b.r*.6 && dy < bucket.h/2 + b.r*.9;
+        if (overlap && b.vel.y < 0 && b.pos.y > bucket.y - bucket.h/2)
+        {
+            bombBucketBounceResponse(b, bucket);
+            bounceBomb(b);
+            continue;
+        }
+
+        // ground hit
+        if (b.pos.y < FLOOR_Y - 10)
+        {
+            bombs.splice(i, 1);
+            if (b.bounces >= 1)
+            {
+                safeGroundHit(b);
+            }
+            else
+            {
+                missBomb(b);
+                roundResetThisFrame = true;
+                break; // IMPORTANT: missBomb/resetRound may clear bombs; stop iterating this frame.
+            }
+            continue;
+        }
+
+        // cleanup if it somehow flies too high
+        if (b.pos.y > PLAY_H/2 + 260)
+            bombs.splice(i, 1);
+    }
+
+    // If we lost a life, the round was reset (and bombs possibly cleared). End update safely.
+    if (roundResetThisFrame || gameOver)
+        return;
+
+    // particles
+    for (let i=particles.length; i--;)
+    {
+        const p = particles[i];
+        p.pos.x += p.vel.x;
+        p.pos.y += p.vel.y;
+        p.vel.y -= .25;     // gravity (down)
+        p.vel.x *= .96;
+        p.vel.y *= .96;
+        if (--p.life <= 0)
+            particles.splice(i, 1);
+    }
+}
+
+function gameUpdatePost()
+{
+    // camera shake
+    let cam = vec2();
+    if (shakeFrames > 0)
+    {
+        shakeFrames--;
+        const t = (shakeFrames / 20);
+        const a = shakeAmount * (t < 0 ? 0 : t);
+        cam = vec2(randRange(-a, a), randRange(-a, a));
+    }
+    setCameraPos(cam);
+}
+
+function gameRender()
+{
+    // sky
+    drawRect(vec2(), vec2(PLAY_W, PLAY_H), hsl(.58, .25, .12));
+
+    // ground line
+    drawRect(vec2(0, FLOOR_Y - 12), vec2(PLAY_W, 6), hsl(0,0,.18));
+
+    // building body
+    const buildingPos = vec2(0, BUILDING_Y);
+    const buildingSize = vec2(BUILDING_W, BUILDING_H);
+    drawRect(buildingPos, buildingSize, hsl(0,0,.15));
+
+    // building edge shading
+    drawRect(buildingPos.add(vec2(-BUILDING_W/2 + 10, 0)), vec2(18, BUILDING_H), hsl(0,0,.12));
+    drawRect(buildingPos.add(vec2( BUILDING_W/2 - 10, 0)), vec2(18, BUILDING_H), hsl(0,0,.18));
+
+    // roof ledge / parapet
+    drawRect(vec2(0, BUILDING_TOP + 8), vec2(BUILDING_W + 30, 20), hsl(0,0,.20));
+    drawRect(vec2(0, BUILDING_TOP), vec2(BUILDING_W + 40, 6), hsl(0,0,.26));
+
+    // windows grid
+    const cols = 9;
+    const rows = 7;
+    const padX = 54;
+    const padY = 60;
+    const winW = 46;
+    const winH = 34;
+
+    const left = -BUILDING_W/2 + padX;
+    const top = BUILDING_TOP - padY;
+
+    for (let r=0; r<rows; ++r)
+    for (let c=0; c<cols; ++c)
+    {
+        const x = left + c * ((BUILDING_W - padX*2) / (cols-1));
+        const y = top - r * ((BUILDING_H - padY*2) / (rows-1));
+
+        // pseudo-random but stable per window
+        const seed = (r*97 + c*131) % 17;
+        const blink = ((time*1.4 + seed) |0) % 5;
+        const lit = blink == 0 || blink == 1;
+
+        // frame
+        drawRect(vec2(x, y), vec2(winW+8, winH+8), hsl(0,0,.10));
+        // glass
+        drawRect(vec2(x, y), vec2(winW, winH), lit ? hsl(.14, .7, .55) : hsl(.58, .18, .08));
+
+        // crossbars
+        drawRect(vec2(x, y), vec2(4, winH), hsl(0,0,.08));
+        drawRect(vec2(x, y), vec2(winW, 4), hsl(0,0,.08));
+    }
+
+    // clown (bomber) on roof
+    // align his feet to the roof line by anchoring his body a bit above BUILDING_TOP
+    const manBaseY = BUILDING_TOP + 46;
+    const headY = manBaseY + 18;
+    const bodyY = manBaseY - 16;
+
+    // body
+    drawRect(vec2(clownX, bodyY), vec2(44, 52), hsl(.08, .7, .55));
+    // head
+    drawCircle(vec2(clownX, headY), 34, hsl(.1, .35, .85), 3, hsl(0,0,0));
+    // eyes
+    drawCircle(vec2(clownX - 8, headY + 3), 6, hsl(0,0,.1));
+    drawCircle(vec2(clownX + 8, headY + 3), 6, hsl(0,0,.1));
+    // smile
+    drawLine(vec2(clownX - 10, headY - 7), vec2(clownX + 10, headY - 7), 3, hsl(0,0,.1));
+
+    // arm / drop flash
+    if (clownDropFlash > 0) clownDropFlash--;
+    const armY = manBaseY - 2;
+    const armDir = clownDir;
+    drawLine(vec2(clownX, armY), vec2(clownX + armDir*32, armY - 14), 5, hsl(.05,.8,.55));
+    if (clownDropFlash)
+        drawCircle(vec2(clownX + armDir*32, armY - 14), 10, hsl(.15,.9,.6));
+
+    // bombs
+    for (const b of bombs)
+    {
+        if (!b || !b.pos) continue;
+
+        // blue after first bounce
+        const c = b.bounces ? hsl(.62, .75, .58) : hsl(.02, .85, .55);
+        drawCircle(b.pos, b.r*2, c, 2, hsl(0,0,0));
+        drawRect(b.pos.add(vec2(0, b.r+4)), vec2(10, 8), hsl(0,0,.1)); // fuse cap
+
+        // tiny bounce counter dot
+        if (b.bounces > 1)
+            drawCircle(b.pos.add(vec2(0, b.r+18)), 6, hsl(.62,.9,.7));
+    }
+
+    // bucket (player) with simple rim & handles
+    const bucketPos = vec2(bucketX, BUCKET_Y);
+    const bucketSize = vec2(bucketW, bucketH);
+
+    drawRect(bucketPos, bucketSize, hsl(.55,.6,.55), 0, false);
+    drawRect(bucketPos.add(vec2(0, bucketH/2 - 6)), vec2(bucketW+10, 10), hsl(.55,.7,.65), 0, false); // rim
+    drawLine(bucketPos.add(vec2(-bucketW/2, 0)), bucketPos.add(vec2(-bucketW/2 - 12, 6)), 3, hsl(.55,.7,.65));
+    drawLine(bucketPos.add(vec2( bucketW/2, 0)), bucketPos.add(vec2( bucketW/2 + 12, 6)), 3, hsl(.55,.7,.65));
+
+    // particles
+    for (const p of particles)
+        drawCircle(p.pos, p.size, hsl(.12, .85, .6, clampf(p.life/34, 0, 1)));
+
+    // lives indicator (3 little buckets)
+    for (let i=0; i<3; ++i)
+    {
+        const x = -PLAY_W/2 + 70 + i*36;
+        const y = PLAY_H/2 - 48;
+        const c2 = i < lives ? hsl(.55,.6,.6) : hsl(0,0,.2);
+        drawRect(vec2(x, y), vec2(26, 16), c2, 0, false, true); // screenSpace = true
+        drawRect(vec2(x, y+7), vec2(30, 6), c2, 0, false, true);
+    }
+}
+
+function gameRenderPost()
+{
+    // HUD
+    drawTextScreen(`SCORE  ${score}`, vec2(20, 26), 28, hsl(0,0,1), 3, hsl(0,0,0), 'left');
+    drawTextScreen(`LEVEL  ${level}`, vec2(20, 56), 22, hsl(0,0,1), 3, hsl(0,0,0), 'left');
+    drawTextScreen(`HI  ${highScore}`, vec2(mainCanvasSize.x-20, 26), 24, hsl(0,0,1), 3, hsl(0,0,0), 'right');
+
+    // instructions / game over
+    if (gameOver)
+    {
+        drawTextScreen('GAME OVER', vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 - 20),
+            72, hsl(.02,.85,.6), 6, hsl(0,0,0));
+        drawTextScreen('Click or press Space to restart', vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 + 40),
+            28, hsl(0,0,1), 4, hsl(0,0,0));
+    }
+    else if (time < 3) // short intro hint
+    {
+        drawTextScreen('Juggle: bounce bombs on the bucket for extra points!',
+            vec2(mainCanvasSize.x/2, mainCanvasSize.y - 54),
+            22, hsl(0,0,1), 3, hsl(0,0,0));
+        drawTextScreen('Move: Mouse/Touch or Arrow Keys / A-D',
+            vec2(mainCanvasSize.x/2, mainCanvasSize.y - 28),
+            20, hsl(0,0,1), 3, hsl(0,0,0));
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Startup LittleJS Engine
+engineInit(gameInit, gameUpdate, gameUpdatePost, gameRender, gameRenderPost);
+
+</script>

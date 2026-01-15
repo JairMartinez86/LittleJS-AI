@@ -1,0 +1,956 @@
+<!DOCTYPE html><head>
+<title>LittleJS AI Starter Project</title>
+<meta charset=utf-8>
+</head><body>
+<script src="https://cdn.jsdelivr.net/npm/littlejsengine@1.17.11/dist/littlejs.js"></script>
+<script>
+'use strict';
+
+// engine settings
+debugWatermark = false;
+showEngineVersion = false;
+
+// AI can use this class to make sound effects
+class SoundGenerator extends Sound
+{
+    constructor(params = {})
+    {
+        const {
+            volume = 1,
+            randomness = .05,
+            frequency = 220,
+            attack = 0,
+            release = .1,
+            shapeCurve = 1,
+            slide = 0,
+            pitchJump = 0,
+            pitchJumpTime = 0,
+            repeatTime = 0,
+            noise = 0,
+            bitCrush = 0,
+            delay = 0,
+        } = params;
+
+        super([volume, randomness, frequency, attack, 0, release, 0, shapeCurve, slide, 0, pitchJump, pitchJumpTime, repeatTime, noise, 0, bitCrush, delay, 1, 0, 0, 0]);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Robotron-ish twin stick (WASD move, mouse aim/shoot)
+
+// world / arena
+const arenaSize = vec2(38, 20);
+const arenaHalf = arenaSize.scale(.5);
+const arenaPadding = 1.2;
+
+// respawn / safety
+const safeZoneRadius = 5;            // keep center clear on respawn
+const respawnInvulnFrames = 90;      // invulnerability after getting hit
+const hitResetDelayFrames = 60;      // brief pause before wave restarts after a hit
+
+// obstacles
+const obstacleKeepoutRadius = safeZoneRadius + 2.2;  // obstacles must not enter center safe zone
+const obstacleMaxCount = 10; // cap hazards (keep arena playable)
+
+// wave pacing
+const interWaveDelayFrames = 90;     // pause between waves
+const waveStartDelayFrames = 30;     // small pause at game start
+
+// game state
+let player;
+let bullets = [];
+let enemies = [];       // includes chasers + sentinels
+let hazards = [];       // static obstacles
+let particles = [];
+let score = 0;
+let best = 0;
+let gameOver = false;
+
+// unique wave name avoids clashes
+let gameWave = 1;
+let waveActive = false;
+let waveTime = 0;       // frames since wave started
+let interWaveTimer = 0; // frames until next wave
+
+// True during GET READY (between waves / after respawn); freezes player and blocks controls
+let playerControlLocked = true;
+
+// sfx
+const sfxShoot = new SoundGenerator({volume:.35, frequency:520, randomness:.08, attack:0, release:.05, shapeCurve:1.4, noise:.05});
+const sfxHit   = new SoundGenerator({volume:.45, frequency:160, randomness:.12, attack:0, release:.12, shapeCurve:.6, slide:-.7, noise:.2});
+const sfxPop   = new SoundGenerator({volume:.55, frequency:240, randomness:.22, attack:0, release:.14, shapeCurve:.8, pitchJump:220, pitchJumpTime:.03, noise:.25});
+
+///////////////////////////////////////////////////////////////////////////////
+// helpers
+
+const clampToArena = (pos, radius=0)=>
+{
+    const minX = -arenaHalf.x + arenaPadding + radius;
+    const maxX =  arenaHalf.x - arenaPadding - radius;
+    const minY = -arenaHalf.y + arenaPadding + radius;
+    const maxY =  arenaHalf.y - arenaPadding - radius;
+    pos.x = clamp(pos.x, minX, maxX);
+    pos.y = clamp(pos.y, minY, maxY);
+    return pos;
+};
+
+function clampToArenaWithBounce(pos, vel, radius=0)
+{
+    const minX = -arenaHalf.x + arenaPadding + radius;
+    const maxX =  arenaHalf.x - arenaPadding - radius;
+    const minY = -arenaHalf.y + arenaPadding + radius;
+    const maxY =  arenaHalf.y - arenaPadding - radius;
+
+    if (pos.x < minX) { pos.x = minX; vel.x = abs(vel.x); }
+    if (pos.x > maxX) { pos.x = maxX; vel.x = -abs(vel.x); }
+    if (pos.y < minY) { pos.y = minY; vel.y = abs(vel.y); }
+    if (pos.y > maxY) { pos.y = maxY; vel.y = -abs(vel.y); }
+}
+
+const overlapAABB = (aPos, aSize, bPos, bSize)=>
+    abs(aPos.x - bPos.x) < (aSize.x + bSize.x) * .5 &&
+    abs(aPos.y - bPos.y) < (aSize.y + bSize.y) * .5;
+
+// Some LittleJS builds don't ship with drawRectScreen; implement it so HUD can use pixel coords.
+function screenToWorld(screenPos)
+{
+    // screenPos is in pixels with origin at TOP-LEFT (mousePosScreen / drawTextScreen)
+    // convert to world space (y up)
+    const x = screenPos.x - mainCanvasSize.x * .5;
+    const y = mainCanvasSize.y * .5 - screenPos.y;
+    return vec2(x, y).scale(1 / cameraScale).add(cameraPos);
+}
+
+function screenSizeToWorld(screenSize)
+{
+    return screenSize.scale(1 / cameraScale);
+}
+
+function drawRectScreen(screenPos, screenSize, color, angle=0, fill=0)
+{
+    drawRect(screenToWorld(screenPos), screenSizeToWorld(screenSize), color, angle, fill);
+}
+
+function getMouseWorld()
+{
+    if (typeof mousePosScreen != 'undefined')
+        return screenToWorld(mousePosScreen);
+    return mousePos;
+}
+
+function randEdgeSpawn()
+{
+    const side = randInt(4);
+    const inset = 0.3;
+    if (side == 0) return vec2(rand(-arenaHalf.x+inset, arenaHalf.x-inset),  arenaHalf.y-inset);
+    if (side == 1) return vec2(rand(-arenaHalf.x+inset, arenaHalf.x-inset), -arenaHalf.y+inset);
+    if (side == 2) return vec2( arenaHalf.x-inset, rand(-arenaHalf.y+inset, arenaHalf.y-inset));
+    return            vec2(-arenaHalf.x+inset, rand(-arenaHalf.y+inset, arenaHalf.y-inset));
+}
+
+function randArenaPosAvoid(minDistFromPlayer, minDistFromCenter)
+{
+    for (let i=0;i<80;i++)
+    {
+        const p = vec2(rand(-arenaHalf.x+2, arenaHalf.x-2), rand(-arenaHalf.y+2, arenaHalf.y-2));
+
+        if (minDistFromCenter && p.length() < minDistFromCenter)
+            continue;
+
+        if (player && minDistFromPlayer)
+        {
+            if (p.subtract(player.pos).length() < minDistFromPlayer)
+                continue;
+        }
+
+        return p;
+    }
+
+    // fallback: edge spawns are always far from center
+    return randEdgeSpawn();
+}
+
+function randArenaPosAvoidHazards(minDistFromCenter, minDistBetween)
+{
+    for (let i=0;i<120;i++)
+    {
+        const p = randArenaPosAvoid(0, minDistFromCenter);
+        let ok = true;
+        for (const h of hazards)
+        {
+            if (h.destroyed) continue;
+            if (p.subtract(h.pos).length() < minDistBetween)
+            {
+                ok = false;
+                break;
+            }
+        }
+        if (ok)
+            return p;
+    }
+    return randEdgeSpawn();
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// lightweight particles (manual)
+
+class SimpleParticle
+{
+    constructor(pos, vel, life, size, color)
+    {
+        this.pos = pos.copy();
+        this.vel = vel.copy();
+        this.life = life; // frames
+        this.size = size;
+        this.color = color;
+    }
+    update()
+    {
+        this.pos = this.pos.add(this.vel);
+        this.vel = this.vel.scale(.92);
+        this.life--;
+    }
+    render()
+    {
+        drawRect(this.pos, vec2(this.size), this.color, 0, 0);
+    }
+}
+
+function burst(pos, count, baseColor)
+{
+    for (let i=0;i<count;i++)
+    {
+        const v = randVec2(rand(.05,.35));
+        const life = randInt(8, 22);
+        const size = rand(.06, .18);
+        const c = baseColor.mutate?.(.2) || baseColor;
+        particles.push(new SimpleParticle(pos, v, life, size, c));
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// game objects
+
+class Bullet extends EngineObject
+{
+    constructor(pos, vel)
+    {
+        super(pos, vec2(.22));
+        this.vel = vel.copy();
+        this.life = 45;
+        this.renderOrder = 5;
+    }
+    update()
+    {
+        this.pos = this.pos.add(this.vel);
+        this.life--;
+        if (this.life <= 0)
+            this.destroy();
+        if (abs(this.pos.x) > arenaHalf.x + 2 || abs(this.pos.y) > arenaHalf.y + 2)
+            this.destroy();
+    }
+    render()
+    {
+        drawRect(this.pos, vec2(.32, .12), rgb(1,.95,.6), this.vel.angle(), 0);
+        drawRect(this.pos, vec2(.18, .18), rgb(1,1,1), 0, 0);
+    }
+}
+
+// Static hazard: kills player and killable enemies on contact. Sentinels ignore.
+class Hazard extends EngineObject
+{
+    constructor(pos, size)
+    {
+        super(pos, size);
+        this.renderOrder = 2;
+        this.angle = rand(-.35, .35);
+    }
+    update() {}
+    render()
+    {
+        // dark base
+        drawRect(this.pos, this.size.add(vec2(.12)), rgb(0,0,0,.25), 0, 0);
+        drawRect(this.pos, this.size, rgb(.2,.2,.22), this.angle, 0);
+
+        // "spikes"
+        const s = this.size;
+        drawRect(this.pos.add(vec2(0, s.y*.28)), vec2(s.x*.9, s.y*.15), rgb(1,.8,.2), this.angle, 0);
+        drawRect(this.pos.add(vec2(0,-s.y*.28)), vec2(s.x*.9, s.y*.15), rgb(1,.55,.1), this.angle, 0);
+        drawRect(this.pos.add(vec2(s.x*.28,0)), vec2(s.x*.15, s.y*.9), rgb(1,.65,.15), this.angle, 0);
+        drawRect(this.pos.add(vec2(-s.x*.28,0)), vec2(s.x*.15, s.y*.9), rgb(1,.65,.15), this.angle, 0);
+    }
+}
+
+// Chaser enemy: slowly moves toward player and speeds up over the wave
+class Enemy extends EngineObject
+{
+    constructor(pos, baseSpeed, hp)
+    {
+        super(pos, vec2(1));
+        this.baseSpeed = baseSpeed;
+        this.hp = hp;
+        this.flash = 0;
+        this.killable = true;
+        this.renderOrder = 4;
+    }
+    getSpeed()
+    {
+        const t = waveTime;
+        const ramp = 1 + min(1.6, t / 1800) * 0.85; // 0..~1.36x over 30s
+        const waveMul = 1 + (gameWave-1) * 0.05;    // +5% per wave
+        return this.baseSpeed * ramp * waveMul;
+    }
+    update()
+    {
+        if (gameOver || !player)
+            return;
+
+        const toP = player.pos.subtract(this.pos);
+        const d = toP.length();
+        const dir = d > .001 ? toP.scale(1/d) : vec2(0,1);
+        this.pos = this.pos.add(dir.scale(this.getSpeed()));
+        this.pos = clampToArena(this.pos, .5);
+
+        if (this.flash > 0) this.flash--;
+    }
+    takeHit(dmg, hitDir)
+    {
+        this.hp -= dmg;
+        this.flash = 6;
+        this.pos = clampToArena(this.pos.add(hitDir.scale(.25)), .5);
+        if (this.hp <= 0)
+        {
+            this.destroy();
+            score += 10;
+            burst(this.pos, 18, rgb(1,.2,.2));
+            sfxPop.play(this.pos);
+        }
+        else
+        {
+            burst(this.pos, 6, rgb(1,.6,.6));
+            sfxHit.play(this.pos);
+        }
+    }
+    render()
+    {
+        const c = this.flash ? rgb(1,1,1) : rgb(.95,.25,.25);
+        drawRect(this.pos, vec2(1.05, 1.05), rgb(.15,.03,.03), 0, 0);
+        drawRect(this.pos, vec2(1, 1), c, 0, 0);
+        drawRect(this.pos.add(vec2(-.2,.15)), vec2(.14,.14), rgb(0,0,0), 0, 0);
+        drawRect(this.pos.add(vec2(.2,.15)),  vec2(.14,.14), rgb(0,0,0), 0, 0);
+    }
+}
+
+// Sentinel enemy: invincible roaming hazard. Does not seek the player.
+class Sentinel extends EngineObject
+{
+    constructor(pos, speed)
+    {
+        super(pos, vec2(1.2));
+        this.killable = false;
+        this.renderOrder = 3;
+        this.speed = speed;
+        this.vel = randVec2(speed);
+        this.turn = rand(-.05, .05);
+    }
+    update()
+    {
+        if (gameOver)
+            return;
+
+        // wander: slowly rotate velocity + a little noise
+        const jitter = rand(-.03, .03);
+        const a = this.turn + jitter;
+        if (this.vel.rotate)
+            this.vel = this.vel.rotate(a);
+        else
+        {
+            const ca = Math.cos(a), sa = Math.sin(a);
+            this.vel = vec2(this.vel.x*ca - this.vel.y*sa, this.vel.x*sa + this.vel.y*ca);
+        }
+
+        // gently avoid player (not a direct attack)
+        if (player)
+        {
+            const away = this.pos.subtract(player.pos);
+            const d2 = away.lengthSquared();
+            if (d2 < 6*6 && d2 > .001)
+                this.vel = this.vel.add(away.scale(1/Math.sqrt(d2)).scale(.05));
+        }
+
+        // normalize to target speed
+        const sp = this.vel.length();
+        if (sp > .001)
+            this.vel = this.vel.scale(this.speed / sp);
+        else
+            this.vel = vec2(this.speed, 0);
+
+        this.pos = this.pos.add(this.vel);
+        clampToArenaWithBounce(this.pos, this.vel, .6);
+    }
+    render()
+    {
+        drawRect(this.pos, vec2(1.32, 1.32), rgb(0,0,0,.2), 0, 0);
+        drawRect(this.pos, vec2(1.2, 1.2), rgb(.65,.25,1), 0, 0);
+        drawRect(this.pos, vec2(.35,.35), rgb(1,1,1), 0, 0);
+        drawRect(this.pos, vec2(1.35,.18), rgb(.35,.1,.6), 0.25, 0);
+        drawRect(this.pos, vec2(1.35,.18), rgb(.35,.1,.6), -0.25, 0);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// wave + spawning
+
+function clearAllEnemies()
+{
+    for (const e of enemies)
+        if (!e.destroyed) e.destroy();
+    enemies = [];
+}
+
+function clearAllHazards()
+{
+    for (const h of hazards)
+        if (!h.destroyed) h.destroy();
+    hazards = [];
+}
+
+function spawnHazardsForWave()
+{
+    clearAllHazards();
+
+    // Fewer hazards: always spawn up to the cap.
+    const count = obstacleMaxCount;
+
+    // Since hazards are player-sized, we can pack them tighter.
+    const minBetween = 1.6;
+
+    for (let i=0;i<count;i++)
+    {
+        // same size as player
+        const size = vec2(1);
+        const pos = randArenaPosAvoidHazards(obstacleKeepoutRadius, minBetween);
+        hazards.push(new Hazard(pos, size));
+    }
+}
+
+function countKillableEnemiesAlive()
+{
+    let n = 0;
+    for (const e of enemies)
+        if (!e.destroyed && e.killable)
+            n++;
+    return n;
+}
+
+function spawnChaser()
+{
+    const pos = randEdgeSpawn();
+    // base speed starts slow; actual speed ramps via Enemy.getSpeed()
+    const baseSpeed = .035 + rand(0, .015) + min(.02, gameWave * .0015);
+    const hp = 1 + (gameWave >= 6) + (gameWave >= 12);
+    enemies.push(new Enemy(pos, baseSpeed, hp));
+}
+
+function spawnSentinel()
+{
+    // sentinels must also avoid the center and the obstacle cluster
+    const pos = randArenaPosAvoid(6, obstacleKeepoutRadius);
+    const speed = .10 + min(.08, gameWave * .004);
+    enemies.push(new Sentinel(pos, speed));
+}
+
+function startWave(w)
+{
+    // Clear all enemies so invincible sentinels respawn fresh.
+    clearAllEnemies();
+
+    // GET READY happens while waveActive is false; starting a wave releases player control.
+    gameWave = w;
+    waveActive = true;
+    waveTime = 0;
+    playerControlLocked = false;
+
+    // spawn everything at start of wave
+    const chasers = (6 + gameWave * 2) * 2; // ~2x more seekers
+    const sentinels = gameWave >= 2 ? 1 + ((gameWave-2) / 3 | 0) : 0;
+
+    for (let i=0;i<chasers;i++)
+        spawnChaser();
+
+    for (let i=0;i<sentinels;i++)
+        spawnSentinel();
+}
+
+function enterGetReadyForWave(nextWave)
+{
+    // Setup the next wave layout during GET READY
+    gameWave = nextWave;
+    waveActive = false;
+    waveTime = 0;
+    playerControlLocked = true;
+
+    // keep player safe
+    if (player)
+        player.pos = vec2(0);
+
+    // clear enemies and generate obstacles for the upcoming wave
+    clearAllEnemies();
+    spawnHazardsForWave();
+}
+
+function endWave()
+{
+    enterGetReadyForWave(gameWave + 1);
+    interWaveTimer = interWaveDelayFrames;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// player and hit reset behavior
+
+function resetAfterHit()
+{
+    // clear bullets
+    for (const b of bullets)
+        if (!b.destroyed) b.destroy();
+    bullets = [];
+
+    // respawn player in center with an opening
+    if (player)
+    {
+        player.pos = vec2(0);
+        player.facing = vec2(0,1);
+        player.cooldown = 10;
+        player.invuln = respawnInvulnFrames;
+        burst(player.pos, 26, rgb(.3,.9,1));
+    }
+
+    // restart current wave after a brief pause (GET READY), regenerate obstacles too
+    enterGetReadyForWave(gameWave);
+    interWaveTimer = hitResetDelayFrames;
+}
+
+class Player extends EngineObject
+{
+    constructor()
+    {
+        super(vec2(0), vec2(1));
+        this.hp = 5;
+        this.invuln = 0;
+        this.cooldown = 0;
+        this.renderOrder = 6;
+        this.facing = vec2(0,1);
+    }
+
+    update()
+    {
+        if (gameOver)
+            return;
+
+        // GET READY: hold player at center and prevent controls.
+        if (playerControlLocked)
+        {
+            this.pos = vec2(0);
+            // freeze facing during lock (no aim/move/shoot)
+            if (this.cooldown > 0) this.cooldown--;
+            if (this.invuln > 0) this.invuln--;
+            return;
+        }
+
+        // movement (fixed 60fps)
+        let move = vec2(0);
+        if (keyIsDown('KeyW')) move.y += 1;
+        if (keyIsDown('KeyS')) move.y -= 1;
+        if (keyIsDown('KeyD')) move.x += 1;
+        if (keyIsDown('KeyA')) move.x -= 1;
+        if (move.lengthSquared() > 0)
+            move = move.normalize(1);
+
+        const speed = .24;
+        this.pos = this.pos.add(move.scale(speed));
+        this.pos = clampToArena(this.pos, .5);
+
+        // aim
+        const aim = getMouseWorld().subtract(this.pos);
+        if (aim.lengthSquared() > .0001)
+            this.facing = aim.normalize(1);
+
+        // shooting
+        if (this.cooldown > 0) this.cooldown--;
+        if (mouseIsDown(0) && this.cooldown <= 0)
+        {
+            const muzzle = this.pos.add(this.facing.scale(.75));
+            const bulletVel = this.facing.scale(.85);
+            bullets.push(new Bullet(muzzle, bulletVel));
+            this.cooldown = 4;
+            sfxShoot.play(muzzle);
+            burst(muzzle, 2, rgb(1,1,.6));
+        }
+
+        if (this.invuln > 0) this.invuln--;
+    }
+
+    damage(fromPos)
+    {
+        if (this.invuln > 0 || gameOver) return;
+
+        this.hp--;
+        sfxHit.play(this.pos);
+        burst(this.pos, 24, rgb(.4,.9,1));
+
+        if (this.hp <= 0)
+        {
+            gameOver = true;
+            best = max(best, score);
+            burst(this.pos, 60, rgb(.6,.9,1));
+            return;
+        }
+
+        // On hit: reset the arena and respawn in center with a safe opening.
+        resetAfterHit();
+    }
+
+    render()
+    {
+        const angle = this.facing.angle();
+        const body = this.invuln ? rgb(.7,1,1) : rgb(.2,.95,.9);
+
+        drawRect(this.pos, vec2(1.05, 1.05), rgb(0,0,0,.2), 0, 0);
+        drawRect(this.pos, vec2(1,1), body, 0, 0);
+        drawRect(this.pos.add(this.facing.scale(.55)), vec2(.75,.18), rgb(.1,.2,.25), angle, 0);
+        drawRect(this.pos, vec2(.35,.35), rgb(1,1,1), 0, 0);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// collisions
+
+function applyBulletHazardCollisions()
+{
+    // bullets can destroy hazards
+    for (const b of bullets)
+    {
+        if (b.destroyed) continue;
+
+        for (const h of hazards)
+        {
+            if (h.destroyed) continue;
+
+            if (overlapAABB(b.pos, vec2(.35,.35), h.pos, h.size))
+            {
+                b.destroy();
+                h.destroy();
+                burst(h.pos, 18, rgb(1,.7,.2));
+                sfxPop.play(h.pos);
+                break;
+            }
+        }
+    }
+}
+
+function applyHazardCollisions()
+{
+    // player vs hazards
+    if (player && !gameOver)
+    {
+        for (const h of hazards)
+        {
+            if (h.destroyed) continue;
+            if (overlapAABB(player.pos, player.size, h.pos, h.size))
+            {
+                player.damage(h.pos);
+                break;
+            }
+        }
+    }
+
+    // enemies vs hazards (killable only; sentinels ignore)
+    for (const e of enemies)
+    {
+        if (e.destroyed) continue;
+        if (!e.killable) continue; // invulnerable enemies ignore obstacles
+
+        for (const h of hazards)
+        {
+            if (h.destroyed) continue;
+            if (overlapAABB(e.pos, e.size, h.pos, h.size))
+            {
+                // No score for obstacle kills (prevents farming)
+                e.destroy();
+                burst(e.pos, 14, rgb(1,.4,.2));
+                sfxHit.play(e.pos);
+                break;
+            }
+        }
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// housekeeping
+
+function cleanupLists()
+{
+    bullets = bullets.filter(o=>!o.destroyed);
+    enemies = enemies.filter(o=>!o.destroyed);
+    hazards = hazards.filter(o=>!o.destroyed);
+    particles = particles.filter(p=>p.life > 0);
+}
+
+function resetGame()
+{
+    engineObjectsDestroy(true);
+    bullets = [];
+    clearAllEnemies();
+    clearAllHazards();
+    particles = [];
+
+    score = 0;
+    gameOver = false;
+    gameWave = 1;
+
+    player = new Player();
+
+    // Start in GET READY and generate the first wave layout
+    waveActive = false;
+    waveTime = 0;
+    interWaveTimer = waveStartDelayFrames;
+    playerControlLocked = true;
+    player.pos = vec2(0);
+
+    spawnHazardsForWave();
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// minimal runtime self-tests (console assertions)
+
+function runSelfTests()
+{
+    console.assert(overlapAABB(vec2(0,0), vec2(1,1), vec2(.4,.4), vec2(1,1)) === true, 'overlapAABB should overlap');
+    console.assert(overlapAABB(vec2(0,0), vec2(1,1), vec2(10,10), vec2(1,1)) === false, 'overlapAABB should not overlap');
+
+    const p = clampToArena(vec2(999, 999), .5);
+    console.assert(abs(p.x) <= arenaHalf.x + 0.001 && abs(p.y) <= arenaHalf.y + 0.001, 'clampToArena should clamp inside arena');
+
+    console.assert(typeof drawRectScreen == 'function', 'drawRectScreen should exist');
+
+    const centerWorld = screenToWorld(mainCanvasSize.scale(.5));
+    console.assert(abs(centerWorld.x) < 1e-6 && abs(centerWorld.y) < 1e-6, 'screenToWorld(center) should be (0,0) when cameraPos is (0,0)');
+
+    const tlWorld = screenToWorld(vec2(0,0));
+    console.assert(tlWorld.y > 0, 'screenToWorld should flip Y (top-left should be positive world Y when camera is centered)');
+
+    // Speed ramp sanity: later in wave should be faster.
+    waveTime = 0; gameWave = 1;
+    const e = new Enemy(vec2(0), .05, 1);
+    const s0 = e.getSpeed();
+    waveTime = 1800;
+    const s1 = e.getSpeed();
+    e.destroy();
+    console.assert(s1 > s0, 'enemy speed should ramp up over waveTime');
+
+    const s = new Sentinel(vec2(0), .1);
+    console.assert(s.killable === false, 'sentinel should be unkillable');
+    s.destroy();
+
+    // spawn helper should respect center opening for hazards
+    const oldPlayer = player;
+    player = null;
+    gameWave = 6;
+    spawnHazardsForWave();
+    console.assert(hazards.length === obstacleMaxCount, 'spawnHazardsForWave should create exactly obstacleMaxCount hazards');
+    for (const h of hazards)
+        console.assert(h.pos.length() >= obstacleKeepoutRadius - 0.001, 'hazard should avoid center keepout');
+    clearAllHazards();
+    player = oldPlayer;
+
+    // hazard collision: killable enemy dies, sentinel survives
+    const testHaz = new Hazard(vec2(8,0), vec2(1,1));
+    hazards = [testHaz];
+    const testEnemy = new Enemy(vec2(8,0), .05, 1);
+    const testSent = new Sentinel(vec2(8,0), .1);
+    enemies = [testEnemy, testSent];
+    applyHazardCollisions();
+    console.assert(testEnemy.destroyed === true, 'hazard should kill killable enemies');
+    console.assert(testSent.destroyed === false, 'hazard should NOT kill sentinel');
+    clearAllEnemies();
+    clearAllHazards();
+
+    // bullet should destroy hazard
+    const testHaz2 = new Hazard(vec2(0,0), vec2(1,1));
+    hazards = [testHaz2];
+    const testBullet = new Bullet(vec2(0,0), vec2(1,0));
+    bullets = [testBullet];
+    applyBulletHazardCollisions();
+    console.assert(testHaz2.destroyed === true, 'bullet should destroy hazard');
+    console.assert(testBullet.destroyed === true, 'bullet should be destroyed on hazard hit');
+    clearAllHazards();
+    bullets = [];
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// LittleJS callbacks
+
+function gameInit()
+{
+    setCanvasFixedSize(vec2(1280, 720));
+    cameraScale = 32;
+    cameraPos = vec2(0);
+
+    runSelfTests();
+    resetGame();
+}
+
+function gameUpdate()
+{
+    if (keyWasPressed('KeyR'))
+        resetGame();
+
+    if (gameOver)
+    {
+        for (const p of particles)
+            p.update();
+        cleanupLists();
+        return;
+    }
+
+    // Wave state machine
+    if (waveActive)
+    {
+        waveTime++;
+        if (countKillableEnemiesAlive() == 0)
+            endWave();
+    }
+    else
+    {
+        if (interWaveTimer > 0)
+            interWaveTimer--;
+        else
+            startWave(gameWave);
+    }
+
+    // particles
+    for (const p of particles)
+        p.update();
+
+    cleanupLists();
+
+    // If we are in GET READY (between waves), keep player centered and lock controls.
+    playerControlLocked = !waveActive;
+    if (playerControlLocked && player)
+        player.pos = vec2(0);
+}
+
+function gameUpdatePost()
+{
+    // bullet -> enemy (only killable ones)
+    for (const b of bullets)
+    for (const e of enemies)
+    {
+        if (b.destroyed || e.destroyed) continue;
+        if (!e.killable) continue;
+
+        if (overlapAABB(b.pos, vec2(.35,.35), e.pos, e.size))
+        {
+            b.destroy();
+            const hitDir = b.vel.lengthSquared() > .001 ? b.vel.normalize(1) : vec2(0,1);
+            e.takeHit(1, hitDir);
+        }
+    }
+
+    // bullets can destroy hazards
+    applyBulletHazardCollisions();
+
+    // hazards kill player and killable enemies
+    applyHazardCollisions();
+
+    // enemy -> player (both types hurt on contact)
+    if (player && !gameOver)
+    for (const e of enemies)
+    {
+        if (e.destroyed) continue;
+        if (overlapAABB(player.pos, player.size, e.pos, e.size))
+            player.damage(e.pos);
+    }
+
+    cleanupLists();
+}
+
+function gameRender()
+{
+    drawRect(cameraPos, vec2(200), rgb(.03,.03,.04));
+
+    // grid
+    for (let x=-arenaHalf.x; x<=arenaHalf.x; x+=1)
+        drawRect(vec2(x,0), vec2(.02, arenaSize.y), rgb(.06,.06,.08));
+    for (let y=-arenaHalf.y; y<=arenaHalf.y; y+=1)
+        drawRect(vec2(0,y), vec2(arenaSize.x, .02), rgb(.06,.06,.08));
+
+    // arena
+    drawRect(vec2(0), arenaSize.add(vec2(.15)), rgb(.2,.2,.25));
+    drawRect(vec2(0), arenaSize, rgb(.02,.02,.03));
+
+    // particles (behind actors)
+    for (const p of particles)
+        p.render();
+
+    // visual hint for safe zone
+    drawRect(vec2(0), vec2(safeZoneRadius*2), rgb(0,0,0,.08), 0, 0);
+}
+
+function gameRenderPost()
+{
+    // crosshair
+    const cross = getMouseWorld();
+    drawRect(cross, vec2(.22,.04), rgb(1,1,1), 0, 0);
+    drawRect(cross, vec2(.04,.22), rgb(1,1,1), 0, 0);
+
+    // HUD
+    const left = vec2(12, mainCanvasSize.y-28);
+    // explicitly set textAlign to 'left' so it never clips off the left edge
+    drawTextScreen(`SCORE ${score}   BEST ${best}   WAVE ${gameWave}`, left, 28, hsl(0,0,1), 4, hsl(0,0,0), 'left');
+
+    if (!gameOver)
+    {
+        const alive = countKillableEnemiesAlive();
+        const status = waveActive
+            ? `ENEMIES ${alive}   SPEED +${(min(1.6, waveTime/1800)*85|0)}%`
+            : `GET READY ${Math.ceil(interWaveTimer/60)}  (HOLD)`;
+        drawTextScreen(status, vec2(mainCanvasSize.x/2, mainCanvasSize.y-28), 24, hsl(0,0,.9), 4, hsl(0,0,0));
+    }
+
+    // HP bars (bottom-left)
+    if (player)
+    {
+        let x = 20;
+        for (let i=0;i<5;i++)
+        {
+            const filled = i < player.hp;
+            const c = filled ? rgb(.2,.95,.9) : rgb(.1,.15,.16);
+            drawRectScreen(vec2(x, 22), vec2(20, 12), c);
+            x += 26;
+        }
+
+        if (player.invuln > 0)
+            drawTextScreen('INVULN', vec2(160, 22), 18, rgb(.7,1,1), 3, hsl(0,0,0));
+    }
+
+    if (gameOver)
+    {
+        drawTextScreen('GAME OVER', vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 + 40), 84, rgb(1,.3,.3), 6, rgb(0,0,0));
+        drawTextScreen('Press R to Restart', vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 - 40), 36, hsl(0,0,1), 4, hsl(0,0,0));
+    }
+    else
+    {
+        drawTextScreen('WASD move  |  Mouse aim + hold Left Click to shoot  |  R restart',
+            vec2(mainCanvasSize.x/2, 22), 24, hsl(0,0,.9), 4, hsl(0,0,0));
+        drawTextScreen('ORANGE BLOCKS are hazards: they kill you and killable enemies. Purple sentinels ignore them.',
+            vec2(mainCanvasSize.x/2, 48), 16, hsl(0,0,.85), 3, hsl(0,0,0));
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Startup LittleJS Engine
+engineInit(gameInit, gameUpdate, gameUpdatePost, gameRender, gameRenderPost);
+
+</script>
+</body>

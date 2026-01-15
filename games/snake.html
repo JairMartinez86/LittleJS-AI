@@ -1,0 +1,297 @@
+<!DOCTYPE html><head>
+<title>LittleJS AI Starter Project</title>
+<meta charset=utf-8>
+</head><body>
+<script src="https://cdn.jsdelivr.net/npm/littlejsengine@1.17.11/dist/littlejs.js"></script>
+<script>
+'use strict';
+
+// engine settings
+debugWatermark = false; // Hide debug watermark in corner
+showEngineVersion = false; // Hide engine version console display
+
+// Basic on-page error overlay so you don't get a blank screen if something throws
+const __errBox = document.createElement('pre');
+__errBox.style.cssText = 'position:fixed;left:0;top:0;right:0;max-height:45%;overflow:auto;'+
+    'margin:0;padding:10px;font:12px/1.4 monospace;background:#200;color:#fbb;z-index:9999;display:none;';
+document.body.appendChild(__errBox);
+window.addEventListener('error', e => {
+    __errBox.style.display = 'block';
+    __errBox.textContent = String(e.error?.stack || e.message || e);
+});
+window.addEventListener('unhandledrejection', e => {
+    __errBox.style.display = 'block';
+    __errBox.textContent = String(e.reason?.stack || e.reason || e);
+});
+
+// AI can use this class to make sound effects
+class SoundGenerator extends Sound 
+{
+    constructor(params = {})
+    {
+        const {
+            volume = 1,        // Volume scale (percent)
+            randomness = .05,  // How much to randomize frequency (percent Hz)
+            frequency = 220,   // Frequency of sound (Hz)
+            attack = 0,        // Attack time, how fast sound starts (seconds)
+            release = .1,      // Release time, how fast sound fades out (seconds)
+            shapeCurve = 1,    // Squareness of wave (0=square, 1=normal, 2=pointy)
+            slide = 0,         // How much to slide frequency (kHz/s)
+            pitchJump = 0,     // Frequency of pitch jump (Hz)
+            pitchJumpTime = 0, // Time of pitch jump (seconds)
+            repeatTime = 0,    // Resets some parameters periodically (seconds)
+            noise = 0,         // How much random noise to add (percent)
+            bitCrush = 0,      // Resamples at a lower frequency in (samples*100)
+            delay = 0,         // Overlap sound with itself for reverb and flanger effects (seconds)
+        } = params;
+        
+        super([volume, randomness, frequency, attack, 0, release, 0, shapeCurve, slide, 0, pitchJump, pitchJumpTime, repeatTime, noise, 0, bitCrush, delay, 1, 0, 0, 0]);
+    }
+}
+
+// Safe localStorage helpers (some embedded previews block storage)
+function storageGet(key, fallback=0)
+{
+    try { return +(localStorage.getItem(key) || fallback); }
+    catch(e) { return fallback; }
+}
+function storageSet(key, value)
+{
+    try { localStorage.setItem(key, ''+value); }
+    catch(e) {}
+}
+
+function makeSfx(params)
+{
+    try { return new SoundGenerator(params); }
+    catch(e) { console.warn('SFX disabled:', e); return { play(){} }; }
+}
+
+const lerp1 = (a,b,t)=>a+(b-a)*t;
+
+///////////////////////////////////////////////////////////////////////////////
+// Snake (grid-based, no textures)
+
+const gridSize = vec2(30, 20);     // width, height in cells
+const stepFrames = 8;              // snake moves once every N frames
+const cellInset = .08;             // visual padding inside a cell
+
+let snake, dir, nextDir, food, score, best, gameOver;
+let stepCounter = 0;
+
+// SFX
+const sfxEat  = makeSfx({volume:.7, frequency:520, attack:0, release:.08, shapeCurve:1.5, slide:-1.2, noise:.02});
+const sfxTurn = makeSfx({volume:.25, frequency:240, attack:0, release:.03, shapeCurve:2});
+const sfxDie  = makeSfx({volume:1, frequency:140, attack:0, release:.25, shapeCurve:.6, slide:-.6, noise:.08, delay:.02});
+
+function vKey(code) { return keyWasPressed(code); }
+
+function randCell()
+{
+    return vec2(
+        (Math.random()*gridSize.x)|0,
+        (Math.random()*gridSize.y)|0
+    );
+}
+
+function cellEquals(a, b) { return a.x === b.x && a.y === b.y; }
+
+function snakeHasCell(c)
+{
+    for (const s of snake)
+        if (cellEquals(s, c))
+            return true;
+    return false;
+}
+
+function spawnFood()
+{
+    for (let i=0; i<200; ++i)
+    {
+        const c = randCell();
+        if (!snakeHasCell(c))
+            return c;
+    }
+    for (let y=0; y<gridSize.y; ++y)
+    for (let x=0; x<gridSize.x; ++x)
+    {
+        const c = vec2(x,y);
+        if (!snakeHasCell(c))
+            return c;
+    }
+    return vec2(0,0);
+}
+
+function restartGame()
+{
+    const start = vec2((gridSize.x/2)|0, (gridSize.y/2)|0);
+    snake = [start.copy(), start.add(vec2(-1,0)), start.add(vec2(-2,0))];
+    dir = vec2(1,0);
+    nextDir = dir.copy();
+    food = spawnFood();
+    score = 0;
+    gameOver = false;
+    stepCounter = 0;
+}
+
+function setDirCandidate(d)
+{
+    // prevent instant 180-degree reversal
+    if (d.x === -dir.x && d.y === -dir.y)
+        return;
+    nextDir = d;
+    sfxTurn.play();
+}
+
+function doStep()
+{
+    dir = nextDir;
+
+    const head = snake[0];
+    const newHead = head.add(dir);
+
+    // wall collision
+    if (newHead.x < 0 || newHead.y < 0 || newHead.x >= gridSize.x || newHead.y >= gridSize.y)
+    {
+        gameOver = true;
+        best = max(best|0, score);
+        storageSet('snakeBest', best|0);
+        sfxDie.play();
+        return;
+    }
+
+    // self collision
+    for (let i=0; i<snake.length; ++i)
+    {
+        if (cellEquals(snake[i], newHead))
+        {
+            gameOver = true;
+            best = max(best|0, score);
+            storageSet('snakeBest', best|0);
+            sfxDie.play();
+            return;
+        }
+    }
+
+    // move
+    snake.unshift(newHead);
+
+    // eat?
+    if (cellEquals(newHead, food))
+    {
+        score++;
+        best = max(best|0, score);
+        storageSet('snakeBest', best|0);
+        food = spawnFood();
+        sfxEat.play();
+    }
+    else
+        snake.pop();
+}
+
+function cellToWorld(c) { return vec2(c.x + .5, c.y + .5); }
+
+///////////////////////////////////////////////////////////////////////////////
+function gameInit()
+{
+    setCanvasClearColor(rgb(.06,.06,.06));
+
+    cameraPos = vec2(gridSize.x/2, gridSize.y/2);
+    // cameraScale updated every frame in gameUpdatePost
+
+    best = storageGet('snakeBest', 0);
+    restartGame();
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameUpdate()
+{
+    if (!gameOver)
+    {
+        if (vKey('ArrowUp')   || vKey('KeyW')) setDirCandidate(vec2(0, 1));
+        if (vKey('ArrowDown') || vKey('KeyS')) setDirCandidate(vec2(0,-1));
+        if (vKey('ArrowLeft') || vKey('KeyA')) setDirCandidate(vec2(-1,0));
+        if (vKey('ArrowRight')|| vKey('KeyD')) setDirCandidate(vec2( 1,0));
+
+        if ((stepCounter++ % stepFrames) === 0)
+            doStep();
+    }
+    else
+    {
+        if (vKey('Enter') || vKey('Space'))
+            restartGame();
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameUpdatePost()
+{
+    cameraPos = vec2(gridSize.x/2, gridSize.y/2);
+    cameraScale = min(mainCanvasSize.x/(gridSize.x+2), mainCanvasSize.y/(gridSize.y+4));
+    if (cameraScale < 1) cameraScale = 1;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameRender()
+{
+    // board background + border
+    const boardCenter = vec2(gridSize.x/2, gridSize.y/2);
+    drawRect(boardCenter, vec2(gridSize.x+1, gridSize.y+1), rgb(.12,.12,.12));
+    drawRect(boardCenter, vec2(gridSize.x,   gridSize.y),   rgb(.08,.08,.08));
+
+    // subtle grid lines
+    const line = rgb(.1,.1,.1);
+    for (let x=0; x<=gridSize.x; ++x)
+        drawRect(vec2(x, gridSize.y/2), vec2(.03, gridSize.y), line);
+    for (let y=0; y<=gridSize.y; ++y)
+        drawRect(vec2(gridSize.x/2, y), vec2(gridSize.x, .03), line);
+
+    // food (NOTE: drawCircle args are (pos, radius, color, lineWidth, lineColor...)
+    const foodPos = cellToWorld(food);
+    drawCircle(foodPos, .42, hsl(.05, 1, .6), .06, hsl(0,0,0));
+
+    // snake
+    for (let i=snake.length-1; i>=0; --i)
+    {
+        const c = snake[i];
+        const p = cellToWorld(c);
+        const s = vec2(1 - cellInset*2);
+        const t = i / max(1, snake.length-1);
+        const col = i === 0 ? hsl(.33, 1, .62) : hsl(.33, 1, lerp1(.35, .55, 1-t));
+        drawRect(p, s, col);
+
+        // tiny "eye" on the head
+        if (i === 0)
+        {
+            const eyeDir = dir.lengthSquared() ? dir : vec2(1,0);
+            const right = vec2(eyeDir.y, -eyeDir.x);
+            const eyeBase = p.add(eyeDir.scale(.22));
+            drawCircle(eyeBase.add(right.scale(.18)), .10, BLACK);
+            drawCircle(eyeBase.add(right.scale(-.18)), .10, BLACK);
+        }
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameRenderPost()
+{
+    const top = 34;
+    drawTextScreen(`SNAKE  Score: ${score}   Best: ${best|0}`,
+        vec2(mainCanvasSize.x/2, top), 36, hsl(0,0,1), 4, hsl(0,0,0));
+
+    drawTextScreen('Arrows / WASD to turn',
+        vec2(mainCanvasSize.x/2, top+34), 22, hsl(0,0,.85), 3, hsl(0,0,0));
+
+    if (gameOver)
+    {
+        const mid = mainCanvasSize.scale(.5);
+        drawTextScreen('GAME OVER', mid.add(vec2(0,-20)), 76, hsl(0,1,.65), 8, hsl(0,0,0));
+        drawTextScreen('Press Enter / Space to restart', mid.add(vec2(0,38)), 28, hsl(0,0,1), 4, hsl(0,0,0));
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Startup LittleJS Engine
+engineInit(gameInit, gameUpdate, gameUpdatePost, gameRender, gameRenderPost);
+
+</script>

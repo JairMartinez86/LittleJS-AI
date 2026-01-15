@@ -1,0 +1,507 @@
+<!DOCTYPE html><head>
+<title>LittleJS AI Starter Project</title>
+<meta charset=utf-8>
+</head><body>
+<script src="https://cdn.jsdelivr.net/npm/littlejsengine@1.17.11/dist/littlejs.js"></script>
+<script>
+'use strict';
+
+// engine settings
+debugWatermark = false; // Hide debug watermark in corner
+showEngineVersion = false; // Hide engine version console display
+
+// AI can use this class to make sound effects
+class SoundGenerator extends Sound 
+{
+    constructor(params = {})
+    {
+        const {
+            volume = 1,        // Volume scale (percent)
+            randomness = .05,  // How much to randomize frequency (percent Hz)
+            frequency = 220,   // Frequency of sound (Hz)
+            attack = 0,        // Attack time, how fast sound starts (seconds)
+            release = .1,      // Release time, how fast sound fades out (seconds)
+            shapeCurve = 1,    // Squarenes of wave (0=square, 1=normal, 2=pointy)
+            slide = 0,         // How much to slide frequency (kHz/s)
+            pitchJump = 0,     // Frequency of pitch jump (Hz)
+            pitchJumpTime = 0, // Time of pitch jump (seconds)
+            repeatTime = 0,    // Resets some parameters periodically (seconds)
+            noise = 0,         // How much random noise to add (percent)
+            bitCrush = 0,      // Resamples at a lower frequency in (samples*100)
+            delay = 0,         // Overlap sound with itself for reverb and flanger effects (seconds)
+        } = params;
+        
+        super([volume, randomness, frequency, attack, 0, release, 0, shapeCurve, slide, 0, pitchJump, pitchJumpTime, repeatTime, noise, 0, bitCrush, delay, 1, 0, 0, 0]);
+    }
+}
+
+// --- Geometry Dash-ish micro runner ------------------------------------------
+// Untextured primitives only: cube auto-runs, jump over spikes/blocks.
+
+// Tunables (fixed 60fps; do not multiply by dt)
+const RUN_SPEED   = .13;   // world units per frame (faster)   // world units per frame (a bit faster)
+const GRAVITY     = -.03;  // units per frame^2 (slower fall/floatier arc)  // units per frame^2
+const JUMP_VEL    = .52;   // lower jump height  // tuned w/ GRAVITY to keep ~same jump height   // units per frame
+const MAX_FALL    = -1.0;  // cap fall speed so drops don't get too snappy
+const FLOOR_Y     = 0;
+
+const PLAYER_SIZE = vec2(.80);
+
+// Game state
+let state;          // 'play' | 'dead' | 'win'
+let player;
+let solids = [];
+let spikes = [];
+let endX = 0;
+let particles = [];
+
+// Sounds
+let sJump, sDie, sWin;
+
+function resetGame()
+{
+    state = 'play';
+    particles.length = 0;
+
+    player = {
+        pos: vec2(2, 1),
+        velY: 0,
+        grounded: false,
+        angle: 0,
+    };
+}
+
+function buildLevel()
+{
+    solids.length = 0;
+    spikes.length = 0;
+
+    // helper: bottom-left -> center/size
+    // style: 0=normal, 1=ceiling (go-under)
+    const addBlock = (x, y, w=1, h=1, style=0) =>
+        solids.push({pos: vec2(x + w/2, y + h/2), size: vec2(w, h), style});
+
+    // helper: spike base on floor or platform
+    const addSpike = (x, y=0, w=1, h=1) =>
+        spikes.push({x, y, w, h});
+
+    // --- Faster + a few more early spikes ---
+    // Spacing rule: every spike/wall has clear run-up + clear landing/recovery.
+
+    // decorative under-floor tiles (not collidable/drawn)
+    for (let i=0; i<130; ++i) addBlock(i, -1, 1, 1);
+
+    // 1) Go-under ceiling bar (stay grounded)
+    // bottom ~0.86 so grounded cube (top ~0.80) fits, but jumping bonks.
+    addBlock(10, 0.86, 4, 0.64, 1); // spans x=[10..14]
+
+    // 2) Early spike run (a couple are double-height)
+    // Spaced so you can still jump, land, and reset before the next.
+    addSpike(20, 0, 1, 1);
+    addSpike(27, 0, 1, 2); // double-height
+    addSpike(34, 0, 1, 2); // double-height
+
+    // 3) Low step (jump onto or over) (jump onto or over)
+    addBlock(42, 0, 2, 1);
+
+    // 4) Spike after the step (separate timing)
+    addSpike(50, 0);
+
+    // 5) Platform + single spike on top (land before and after)
+    addBlock(58, 2, 6, 1);     // top is y=3
+    addSpike(61, 3, 1, 1);
+
+    // 6) Go-under ceiling bar (stay grounded)
+    addBlock(72, 0.86, 4, 0.64, 1); // spans x=[72..76]
+
+    // 7) Two spaced ground spikes
+    addSpike(82, 0);
+    addSpike(90, 0);
+
+    // 8) Tall wall (big jump)
+    addBlock(98, 0, 1, 2);
+
+    // 9) Finale spikes (still spaced)
+    addSpike(106, 0);
+    addSpike(114, 0);
+
+    endX = 120;
+}
+
+function wantJump()
+{
+    return keyWasPressed('Space') || keyWasPressed('ArrowUp') || mouseWasPressed(0) || gamepadWasPressed(0);
+}
+
+function aabbOverlap(posA, sizeA, posB, sizeB)
+{
+    return isOverlapping(posA, sizeA, posB, sizeB);
+}
+
+function pointInTri(p, a, b, c)
+{
+    // barycentric
+    const v0 = c.subtract(a);
+    const v1 = b.subtract(a);
+    const v2 = p.subtract(a);
+    const dot00 = v0.dot(v0);
+    const dot01 = v0.dot(v1);
+    const dot02 = v0.dot(v2);
+    const dot11 = v1.dot(v1);
+    const dot12 = v1.dot(v2);
+    const invDen = 1 / (dot00 * dot11 - dot01 * dot01);
+    const u = (dot11 * dot02 - dot01 * dot12) * invDen;
+    const v = (dot00 * dot12 - dot01 * dot02) * invDen;
+    return u >= 0 && v >= 0 && (u + v) <= 1;
+}
+
+function killPlayer()
+{
+    if (state !== 'play') return;
+    state = 'dead';
+    sDie.play(player.pos);
+
+    // little burst
+    for (let i=0; i<18; ++i)
+    {
+        const a = rand(PI*2);
+        const sp = rand(.35, .12);
+        particles.push({
+            pos: player.pos.copy(),
+            vel: vec2(Math.cos(a), Math.sin(a)).scale(sp),
+            life: rand(40, 25),
+            size: rand(.22, .10),
+        });
+    }
+}
+
+function winGame()
+{
+    if (state !== 'play') return;
+    state = 'win';
+    sWin.play(player.pos);
+}
+
+function updateParticles()
+{
+    for (let i=particles.length; i--;)
+    {
+        const p = particles[i];
+        p.life -= 1;
+        p.vel.y += GRAVITY * .35;
+        p.pos = p.pos.add(p.vel);
+        p.size *= .98;
+        if (p.life <= 0 || p.size < .02)
+            particles.splice(i, 1);
+    }
+}
+
+function playerStep()
+{
+    const prev = player.pos.copy();
+
+    // auto-run (constant speed, even while jumping)
+    player.pos.x += RUN_SPEED;
+
+    // jump
+    if (player.grounded && wantJump())
+    {
+        player.velY = JUMP_VEL;
+        player.grounded = false;
+        sJump.play(player.pos);
+    }
+
+    // gravity
+    player.velY = max(MAX_FALL, player.velY + GRAVITY);
+    player.pos.y += player.velY;
+
+    // floor collide
+    const halfY = PLAYER_SIZE.y/2;
+    if (player.pos.y - halfY < FLOOR_Y)
+    {
+        player.pos.y = FLOOR_Y + halfY;
+        player.velY = 0;
+        player.grounded = true;
+    }
+    else
+        player.grounded = false;
+
+    // block collide
+    for (const b of solids)
+    {
+        // skip under-floor visuals (we used y=-1 for looks)
+        if (b.pos.y + b.size.y/2 <= FLOOR_Y) continue;
+
+        if (!aabbOverlap(player.pos, PLAYER_SIZE, b.pos, b.size))
+            continue;
+
+        const blockTop    = b.pos.y + b.size.y/2;
+        const blockBottom = b.pos.y - b.size.y/2;
+        const prevBottom  = prev.y - halfY;
+        const prevTop     = prev.y + halfY;
+        const currBottom  = player.pos.y - halfY;
+        const currTop     = player.pos.y + halfY;
+
+        const comingFromAbove = prevBottom >= blockTop - 1e-6;
+        const passingTop      = currBottom < blockTop;
+
+        if (comingFromAbove && passingTop)
+        {
+            // land
+            player.pos.y = blockTop + halfY;
+            player.velY = 0;
+            player.grounded = true;
+        }
+        else
+        {
+            // side/underside bonk is death
+            killPlayer();
+            return;
+        }
+    }
+
+    // spike collide (triangle test)
+    const hx = PLAYER_SIZE.x/2;
+    const hy = PLAYER_SIZE.y/2;
+    const corners = [
+        vec2(player.pos.x - hx, player.pos.y - hy),
+        vec2(player.pos.x + hx, player.pos.y - hy),
+        vec2(player.pos.x - hx, player.pos.y + hy),
+        vec2(player.pos.x + hx, player.pos.y + hy),
+    ];
+
+    for (const s of spikes)
+    {
+        const spikeCenter = vec2(s.x + s.w/2, s.y + s.h/2);
+        const spikeSize   = vec2(s.w, s.h);
+
+        if (!aabbOverlap(player.pos, PLAYER_SIZE, spikeCenter, spikeSize))
+            continue;
+
+        const a = vec2(s.x,           s.y);
+        const b = vec2(s.x + s.w,     s.y);
+        const c = vec2(s.x + s.w/2,   s.y + s.h);
+
+        // If any player corner is inside triangle => hit
+        for (const p of corners)
+        {
+            if (pointInTri(p, a, b, c))
+            {
+                killPlayer();
+                return;
+            }
+        }
+
+        // extra safety: if player is very low and overlapping bbox, treat as hit
+        if (player.pos.y - hy < s.y + .1)
+        {
+            killPlayer();
+            return;
+        }
+    }
+
+    // fall out
+    if (player.pos.y < -6)
+        killPlayer();
+
+    // win
+    if (player.pos.x > endX)
+        winGame();
+
+    // cube rotation vibe
+    if (!player.grounded)
+        player.angle += .28;
+    else
+    {
+        // ease toward nearest 90° multiple
+        const target = Math.round(player.angle / (PI/2)) * (PI/2);
+        player.angle = lerpAngle(player.angle, target, .35);
+    }
+}
+
+function drawSpike(s)
+{
+    const a = vec2(s.x,           s.y);
+    const b = vec2(s.x + s.w,     s.y);
+    const c = vec2(s.x + s.w/2,   s.y + s.h);
+    drawPoly([a,b,c], hsl(.02, .85, .55));
+    // little highlight line
+    drawLine(c, a.lerp(b,.5), .06, hsl(0,0,1,.35));
+}
+
+function drawBlock(b)
+{
+    if (b.style === 1)
+    {
+        // ceiling bars (distinct look)
+        drawRect(b.pos, b.size, hsl(.02, .55, .25));
+        drawRect(b.pos, b.size.scale(.86), hsl(.02, .45, .16));
+        drawLine(vec2(b.pos.x - b.size.x/2, b.pos.y - b.size.y/2), vec2(b.pos.x + b.size.x/2, b.pos.y - b.size.y/2), .06, hsl(0,0,1,.22));
+        return;
+    }
+
+    // normal blocks
+    drawRect(b.pos, b.size, hsl(.58, .55, .35));
+    drawRect(b.pos, b.size.scale(.82), hsl(.58, .35, .22));
+}
+
+function drawBackground()
+{
+    const camSize = getCameraSize();
+
+    // sky
+    drawRect(cameraPos, camSize.scale(1.05), hsl(.62, .45, .12));
+
+    // parallax stripes
+    const left = cameraPos.x - camSize.x/2;
+    const right = cameraPos.x + camSize.x/2;
+    const stripeH = camSize.y;
+    const t = time;
+    for (let i=0; i<14; ++i)
+    {
+        const x = left + ((i*6 + t*1.2) % (camSize.x + 30));
+        const pos = vec2(x, cameraPos.y);
+        drawRect(pos, vec2(1.5, stripeH), hsl(.62, .45, .14, .12));
+    }
+
+    // subtle grid
+    const gx0 = Math.floor(left) - 1;
+    const gx1 = Math.ceil(right) + 1;
+    const gy0 = Math.floor(cameraPos.y - camSize.y/2) - 1;
+    const gy1 = Math.ceil(cameraPos.y + camSize.y/2) + 1;
+    for (let x=gx0; x<=gx1; ++x)
+        drawLine(vec2(x, gy0), vec2(x, gy1), .03, hsl(0,0,1,.06));
+    for (let y=gy0; y<=gy1; ++y)
+        drawLine(vec2(gx0, y), vec2(gx1, y), .03, hsl(0,0,1,.06));
+}
+
+function drawFloor()
+{
+    const camSize = getCameraSize();
+    const w = camSize.x + 10;
+    const centerX = cameraPos.x;
+
+    // floor slab
+    drawRect(vec2(centerX, -0.5), vec2(w, 1), hsl(.62, .20, .06));
+
+    // top edge
+    drawLine(vec2(centerX - w/2, 0), vec2(centerX + w/2, 0), .08, hsl(0,0,1,.22));
+}
+
+function drawPlayer()
+{
+    // shadow
+    drawRect(vec2(player.pos.x, FLOOR_Y + .05), vec2(.9, .12), hsl(0,0,0,.25));
+
+    // cube
+    drawRect(player.pos, PLAYER_SIZE, hsl(.90, .75, .58), player.angle);
+    drawRect(player.pos, PLAYER_SIZE.scale(.78), hsl(.90, .70, .35), player.angle);
+
+    // tiny face dot (screen-ish vibe)
+    const eyeOffset = vec2(.16, .08).rotate(player.angle);
+    drawRect(player.pos.add(eyeOffset), vec2(.10, .10), hsl(0,0,1,.9));
+}
+
+function drawParticles()
+{
+    for (const p of particles)
+    {
+        const a = clamp(p.life / 40, 0, 1);
+        drawRect(p.pos, vec2(p.size), hsl(.90, .75, .65, a));
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameInit()
+{
+    // called once after the engine starts up
+    setShowSplashScreen(false);
+    setCanvasFixedSize(vec2(1280, 720));
+    cameraScale = 64;
+
+    sJump = new SoundGenerator({frequency: 520, attack: 0, release: .08, shapeCurve: 1.2, volume: .55, randomness: .03});
+    sDie  = new SoundGenerator({frequency: 140, attack: 0, release: .22, shapeCurve: .4,  volume: .85, noise: .2,  randomness: .08});
+    sWin  = new SoundGenerator({frequency: 740, attack: 0, release: .18, shapeCurve: 1.3, volume: .7,  pitchJump: 220, pitchJumpTime: .06});
+
+    buildLevel();
+    resetGame();
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameUpdate()
+{
+    // called every frame at 60 frames per second
+    if (state !== 'play')
+    {
+        updateParticles();
+        if (wantJump() || keyWasPressed('KeyR'))
+            resetGame();
+        return;
+    }
+
+    playerStep();
+    updateParticles();
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameUpdatePost()
+{
+    // called after physics and objects are updated
+    // setup camera and prepare for render
+    const lookAhead = 7.2;
+    const targetX = player.pos.x + lookAhead;
+    const targetY = 4;
+    cameraPos = vec2(targetX, targetY);
+    cameraAngle = 0;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameRender()
+{
+    // called before objects are rendered
+    drawBackground();
+    drawFloor();
+
+    // draw solids
+    for (const b of solids)
+    {
+        // only draw in-view-ish (cheap test)
+        if (b.pos.y + b.size.y/2 <= FLOOR_Y) continue; // skip under-floor visuals
+        drawBlock(b);
+    }
+
+    // spikes
+    for (const s of spikes)
+        drawSpike(s);
+
+    drawParticles();
+    drawPlayer();
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameRenderPost()
+{
+    // HUD
+    const progress = clamp(player.pos.x / endX, 0, 1);
+    const pct = (progress * 100)|0;
+
+    drawTextScreen(`SPACE / CLICK to jump   •   R to restart`, vec2(mainCanvasSize.x/2, 38), 28, hsl(0,0,1,.8), 4, hsl(0,0,0,.6));
+    drawTextScreen(`Progress: ${pct}%`, vec2(mainCanvasSize.x/2, 74), 34, hsl(0,0,1,.85), 4, hsl(0,0,0,.6));
+
+    if (state === 'dead')
+    {
+        drawTextScreen('CRASH!', vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 - 60), 110, hsl(0, .9, .6), 10, hsl(0,0,0,.8));
+        drawTextScreen('Press SPACE / CLICK to try again', vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 + 30), 44, hsl(0,0,1,.9), 6, hsl(0,0,0,.8));
+    }
+    else if (state === 'win')
+    {
+        drawTextScreen('LEVEL CLEAR!', vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 - 60), 110, hsl(.33, .9, .55), 10, hsl(0,0,0,.8));
+        drawTextScreen('Press SPACE / CLICK to play again', vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 + 30), 44, hsl(0,0,1,.9), 6, hsl(0,0,0,.8));
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Startup LittleJS Engine
+engineInit(gameInit, gameUpdate, gameUpdatePost, gameRender, gameRenderPost);
+
+</script>

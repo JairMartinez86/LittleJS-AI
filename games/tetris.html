@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>LittleJS Tetris</title>
+  <style>
+    html,body{margin:0;overflow:hidden;background:#000;}
+  </style>
+</head>
+<body>
+<script src="https://cdn.jsdelivr.net/npm/littlejsengine@1.17.11/dist/littlejs.min.js"></script>
+<script>
+'use strict';
+
+// ------------------------------------------------------------
+// Tiny Tetris (one-file, no assets)
+// Controls:
+//   ←/→ move, ↓ soft drop, Space hard drop
+//   Z rotate CCW, X/↑ rotate CW
+//   C hold (once per drop)
+//   P pause, R restart
+// ------------------------------------------------------------
+
+// Board
+const W = 10, H = 20;
+let board;              // [H][W] = 0 or color index (1..7)
+let score = 0;
+let lines = 0;
+let level = 1;
+let gameOver = false;
+let pausedLocal = false;
+
+// Timers
+let fallTimer = 0;
+let lockTimer = 0;
+let moveRepeatL = 0, moveRepeatR = 0, softRepeat = 0;
+
+// Piece state
+let bag = [];
+let cur = null;         // {type, rot, x, y}
+let nextType = 0;
+let holdType = 0;
+let holdUsed = false;
+
+// Visuals
+const COLORS = [
+  rgb(0,0,0,0),      // 0 empty
+  rgb(0,1,1),        // I
+  rgb(0,0,1),        // J
+  rgb(1,.5,0),       // L
+  rgb(1,1,0),        // O
+  rgb(0,1,0),        // S
+  rgb(.6,0,1),       // T
+  rgb(1,0,0),        // Z
+];
+
+// Tetromino definitions as 4 rotation states of 4 blocks (x,y) in a 4x4
+// Coordinates are in [0..3], origin top-left.
+// Types: 1..7
+const SHAPES = {
+  1: [ // I
+    [[0,1],[1,1],[2,1],[3,1]],
+    [[2,0],[2,1],[2,2],[2,3]],
+    [[0,2],[1,2],[2,2],[3,2]],
+    [[1,0],[1,1],[1,2],[1,3]],
+  ],
+  2: [ // J
+    [[0,0],[0,1],[1,1],[2,1]],
+    [[1,0],[2,0],[1,1],[1,2]],
+    [[0,1],[1,1],[2,1],[2,2]],
+    [[1,0],[1,1],[0,2],[1,2]],
+  ],
+  3: [ // L
+    [[2,0],[0,1],[1,1],[2,1]],
+    [[1,0],[1,1],[1,2],[2,2]],
+    [[0,1],[1,1],[2,1],[0,2]],
+    [[0,0],[1,0],[1,1],[1,2]],
+  ],
+  4: [ // O
+    [[1,0],[2,0],[1,1],[2,1]],
+    [[1,0],[2,0],[1,1],[2,1]],
+    [[1,0],[2,0],[1,1],[2,1]],
+    [[1,0],[2,0],[1,1],[2,1]],
+  ],
+  5: [ // S
+    [[1,0],[2,0],[0,1],[1,1]],
+    [[1,0],[1,1],[2,1],[2,2]],
+    [[1,1],[2,1],[0,2],[1,2]],
+    [[0,0],[0,1],[1,1],[1,2]],
+  ],
+  6: [ // T
+    [[1,0],[0,1],[1,1],[2,1]],
+    [[1,0],[1,1],[2,1],[1,2]],
+    [[0,1],[1,1],[2,1],[1,2]],
+    [[1,0],[0,1],[1,1],[1,2]],
+  ],
+  7: [ // Z
+    [[0,0],[1,0],[1,1],[2,1]],
+    [[2,0],[1,1],[2,1],[1,2]],
+    [[0,1],[1,1],[1,2],[2,2]],
+    [[1,0],[0,1],[1,1],[0,2]],
+  ],
+};
+
+function resetGame() {
+  board = Array.from({length:H}, ()=> Array(W).fill(0));
+  score = 0; lines = 0; level = 1;
+  gameOver = false; pausedLocal = false;
+  fallTimer = 0; lockTimer = 0;
+  moveRepeatL = moveRepeatR = softRepeat = 0;
+  bag = [];
+  holdType = 0; holdUsed = false;
+  nextType = pullFromBag();
+  spawnPiece();
+}
+
+function shuffle(a) {
+  for (let i=a.length-1; i>0; --i) {
+    const j = (rand(i+1)|0);
+    const t = a[i]; a[i] = a[j]; a[j] = t;
+  }
+  return a;
+}
+
+function pullFromBag() {
+  if (!bag.length) bag = shuffle([1,2,3,4,5,6,7]);
+  return bag.pop();
+}
+
+function spawnPiece() {
+  const type = nextType;
+  nextType = pullFromBag();
+  cur = {type, rot:0, x:3, y:-1};
+  holdUsed = false;
+  lockTimer = 0;
+  if (collides(cur.x, cur.y, cur.rot, cur.type)) {
+    gameOver = true;
+  }
+}
+
+function getBlocks(x, y, rot, type) {
+  return SHAPES[type][rot].map(p=> ({x:x+p[0], y:y+p[1]}));
+}
+
+function collides(x, y, rot, type) {
+  const blocks = getBlocks(x,y,rot,type);
+  for (const b of blocks) {
+    if (b.x < 0 || b.x >= W) return true;
+    if (b.y >= H) return true;
+    if (b.y >= 0 && board[b.y][b.x]) return true;
+  }
+  return false;
+}
+
+function tryMove(dx, dy) {
+  if (!cur) return false;
+  const nx = cur.x + dx;
+  const ny = cur.y + dy;
+  if (!collides(nx, ny, cur.rot, cur.type)) {
+    cur.x = nx; cur.y = ny;
+    if (dy) lockTimer = 0;
+    return true;
+  }
+  return false;
+}
+
+function tryRotate(dir) {
+  if (!cur) return false;
+  const oldRot = cur.rot;
+  const newRot = (cur.rot + (dir>0?1:3)) & 3;
+
+  // super-simple wall kicks (good enough for a prototype)
+  const kicks = [
+    {x:0,y:0}, {x:-1,y:0}, {x:1,y:0}, {x:-2,y:0}, {x:2,y:0}, {x:0,y:-1},
+  ];
+  for (const k of kicks) {
+    if (!collides(cur.x+k.x, cur.y+k.y, newRot, cur.type)) {
+      cur.x += k.x; cur.y += k.y; cur.rot = newRot;
+      lockTimer = 0;
+      return true;
+    }
+  }
+
+  cur.rot = oldRot;
+  return false;
+}
+
+function hardDrop() {
+  if (!cur) return;
+  let dropped = 0;
+  while (tryMove(0,1)) dropped++;
+  if (dropped) score += dropped * 2;
+  lockPiece();
+}
+
+function hold() {
+  if (!cur || holdUsed) return;
+  const t = cur.type;
+  if (!holdType) {
+    holdType = t;
+    spawnPiece();
+  } else {
+    cur = {type:holdType, rot:0, x:3, y:-1};
+    holdType = t;
+    lockTimer = 0;
+    if (collides(cur.x, cur.y, cur.rot, cur.type)) gameOver = true;
+  }
+  holdUsed = true;
+}
+
+function lockPiece() {
+  if (!cur) return;
+  const blocks = getBlocks(cur.x, cur.y, cur.rot, cur.type);
+  for (const b of blocks) {
+    if (b.y < 0) { gameOver = true; continue; }
+    board[b.y][b.x] = cur.type;
+  }
+  clearLines();
+  spawnPiece();
+}
+
+function clearLines() {
+  let cleared = 0;
+  for (let y=H-1; y>=0; --y) {
+    if (board[y].every(v=>v)) {
+      board.splice(y,1);
+      board.unshift(Array(W).fill(0));
+      cleared++;
+      y++; // re-check same row index after pull down
+    }
+  }
+  if (!cleared) return;
+
+  lines += cleared;
+  level = 1 + (lines/10|0);
+
+  // Scoring similar-ish to guideline (not exact NES)
+  const lineScore = [0, 100, 300, 500, 800][cleared] || 0;
+  score += lineScore * level;
+}
+
+function fallInterval() {
+  // faster as level increases, clamped
+  return max(0.05, 0.8 - (level-1)*0.06);
+}
+
+function lockDelay() {
+  return 0.5; // seconds you can keep moving/rotating after touching ground
+}
+
+// ---- LittleJS callbacks ----
+function gameInit() {
+  // Fixed canvas so it always looks consistent
+  setCanvasFixedSize(vec2(820, 960));
+  setInputPreventDefault(true);
+  setCameraPos(vec2());
+  cameraScale = 1;
+  resetGame();
+}
+
+function gameUpdate() {
+  if (keyWasPressed('KeyP')) pausedLocal = !pausedLocal;
+  if (keyWasPressed('KeyR')) resetGame();
+
+  if (pausedLocal || gameOver) return;
+
+  // movement: initial press + repeat when held
+  const repDelay = 0.16;
+  const repRate  = 0.05;
+
+  const leftDown  = keyIsDown('ArrowLeft');
+  const rightDown = keyIsDown('ArrowRight');
+
+  if (keyWasPressed('ArrowLeft')) { tryMove(-1,0); moveRepeatL = repDelay; }
+  if (keyWasPressed('ArrowRight')){ tryMove( 1,0); moveRepeatR = repDelay; }
+
+  if (leftDown && !rightDown) {
+    moveRepeatL -= timeDelta;
+    if (moveRepeatL <= 0) { tryMove(-1,0); moveRepeatL += repRate; }
+  } else moveRepeatL = 0;
+
+  if (rightDown && !leftDown) {
+    moveRepeatR -= timeDelta;
+    if (moveRepeatR <= 0) { tryMove(1,0); moveRepeatR += repRate; }
+  } else moveRepeatR = 0;
+
+  // rotation
+  if (keyWasPressed('KeyZ')) tryRotate(-1);
+  if (keyWasPressed('KeyX') || keyWasPressed('ArrowUp')) tryRotate(1);
+
+  // hold
+  if (keyWasPressed('KeyC')) hold();
+
+  // hard drop
+  if (keyWasPressed('Space')) hardDrop();
+
+  // soft drop
+  const softDown = keyIsDown('ArrowDown');
+  if (keyWasPressed('ArrowDown')) { tryMove(0,1); score += 1; softRepeat = 0.03; }
+  if (softDown) {
+    softRepeat -= timeDelta;
+    if (softRepeat <= 0) {
+      if (tryMove(0,1)) score += 1;
+      softRepeat = 0.03;
+    }
+  }
+
+  // gravity
+  fallTimer += timeDelta;
+  const interval = fallInterval();
+  if (fallTimer >= interval) {
+    fallTimer -= interval;
+    if (!tryMove(0,1)) {
+      // touching ground
+      lockTimer += interval;
+      if (lockTimer >= lockDelay()) lockPiece();
+    }
+  }
+  else {
+    // if we're currently touching ground, count lock delay time too
+    if (cur && collides(cur.x, cur.y+1, cur.rot, cur.type)) {
+      lockTimer += timeDelta;
+      if (lockTimer >= lockDelay()) lockPiece();
+    } else {
+      lockTimer = 0;
+    }
+  }
+}
+
+function gameUpdatePost() {
+  // no camera stuff needed (we render in screen space)
+}
+
+function drawRectScreen(pos, size, color) {
+  // drawTile supports screenSpace, and tileInfo can be undefined for untextured rects
+  drawTile(pos, size, undefined, color, 0, false, undefined, false, true);
+}
+
+function drawCell(x, y, type, origin, cell, pad=2) {
+  const px = origin.x + x*cell + cell/2;
+  const py = origin.y + y*cell + cell/2;
+  const s = cell - pad;
+  drawRectScreen(vec2(px, py), vec2(s, s), COLORS[type]);
+}
+
+function computeLayout() {
+  const cell = min(40, (mainCanvasSize.y - 160) / H);
+  const boardPxW = W * cell;
+  const boardPxH = H * cell;
+  // Keep the board on the left and reserve space for the sidebar UI
+  const origin = vec2(60, mainCanvasSize.y/2 - boardPxH/2 + 30);
+  return {cell, boardPxW, boardPxH, origin};
+}
+
+function ghostY() {
+  if (!cur) return cur?.y ?? 0;
+  let y = cur.y;
+  while (!collides(cur.x, y+1, cur.rot, cur.type)) y++;
+  return y;
+}
+
+function gameRender() {
+  // background
+  drawRectScreen(mainCanvasSize.scale(.5), mainCanvasSize, rgb(.03,.03,.04));
+}
+
+function drawMini(type, topLeft, cell) {
+  // 4x4 mini grid
+  const bgSize = vec2(cell*4 + 16, cell*4 + 16);
+  drawRectScreen(topLeft.add(bgSize.scale(.5)), bgSize, rgb(.08,.08,.1));
+
+  const blocks = SHAPES[type][0];
+  for (const b of blocks) {
+    const x = b[0], y = b[1];
+    const px = topLeft.x + 8 + x*cell + cell/2;
+    const py = topLeft.y + 8 + y*cell + cell/2;
+    drawRectScreen(vec2(px, py), vec2(cell-2, cell-2), COLORS[type]);
+  }
+}
+
+function gameRenderPost() {
+  const {cell, boardPxW, boardPxH, origin} = computeLayout();
+
+  // board frame
+  drawRectScreen(origin.add(vec2(boardPxW/2, boardPxH/2)), vec2(boardPxW+10, boardPxH+10), rgb(.15,.15,.2));
+  drawRectScreen(origin.add(vec2(boardPxW/2, boardPxH/2)), vec2(boardPxW, boardPxH), rgb(.02,.02,.03));
+
+  // settled blocks
+  for (let y=0; y<H; ++y)
+  for (let x=0; x<W; ++x)
+    if (board[y][x]) drawCell(x,y,board[y][x],origin,cell);
+
+  // ghost piece
+  if (cur && !gameOver) {
+    const gy = ghostY();
+    const ghostBlocks = getBlocks(cur.x, gy, cur.rot, cur.type);
+    for (const b of ghostBlocks) {
+      if (b.y < 0) continue;
+      const px = origin.x + b.x*cell + cell/2;
+      const py = origin.y + b.y*cell + cell/2;
+      drawRectScreen(vec2(px, py), vec2(cell-6, cell-6), rgb(1,1,1,.12));
+    }
+  }
+
+  // active piece
+  if (cur) {
+    const blocks = getBlocks(cur.x, cur.y, cur.rot, cur.type);
+    for (const b of blocks) {
+      if (b.y < 0) continue;
+      drawCell(b.x, b.y, cur.type, origin, cell);
+    }
+  }
+
+  // UI
+  const uiX = origin.x + boardPxW + 40;
+  const uiTop = origin.y;
+  const textColor = rgb(1,1,1);
+
+  drawTextScreen('Running…', vec2(70, 30), 26, rgb(.8,.9,1), 4, rgb(0,0,0));
+
+  drawTextScreen('SCORE', vec2(uiX+60, uiTop+10), 22, textColor, 4, rgb(0,0,0), 'left');
+  drawTextScreen(String(score), vec2(uiX+60, uiTop+36), 26, rgb(1,1,0.7), 4, rgb(0,0,0), 'left');
+
+  drawTextScreen('LINES', vec2(uiX+60, uiTop+76), 22, textColor, 4, rgb(0,0,0), 'left');
+  drawTextScreen(String(lines), vec2(uiX+60, uiTop+102), 26, rgb(.8,1,.8), 4, rgb(0,0,0), 'left');
+
+  drawTextScreen('LEVEL', vec2(uiX+60, uiTop+142), 22, textColor, 4, rgb(0,0,0), 'left');
+  drawTextScreen(String(level), vec2(uiX+60, uiTop+168), 26, rgb(.8,.8,1), 4, rgb(0,0,0), 'left');
+
+  // Next + Hold boxes
+  const miniCell = max(14, min(22, cell*0.6));
+
+  drawTextScreen('NEXT', vec2(uiX+60, uiTop+220), 22, textColor, 4, rgb(0,0,0), 'left');
+  drawMini(nextType, vec2(uiX+60, uiTop+240), miniCell);
+
+  drawTextScreen('HOLD (C)', vec2(uiX+60, uiTop+360), 22, textColor, 4, rgb(0,0,0), 'left');
+  if (holdType) drawMini(holdType, vec2(uiX+60, uiTop+380), miniCell);
+  else drawRectScreen(vec2(uiX+60 + (miniCell*4+16)/2, uiTop+380 + (miniCell*4+16)/2), vec2(miniCell*4+16, miniCell*4+16), rgb(.08,.08,.1));
+
+  // Controls
+  const help =
+    '←/→ move   ↓ soft\n' +
+    'Z/X or ↑ rotate\n' +
+    'Space hard drop\n' +
+    'C hold   P pause\n' +
+    'R restart';
+  drawTextScreen(help, vec2(uiX+60, uiTop+540), 18, rgb(.9,.9,.95), 4, rgb(0,0,0), 'left');
+
+  if (pausedLocal && !gameOver) {
+    drawRectScreen(mainCanvasSize.scale(.5), vec2(mainCanvasSize.x, 140), rgb(0,0,0,.6));
+    drawTextScreen('PAUSED', mainCanvasSize.scale(.5), 60, rgb(1,1,1), 6, rgb(0,0,0));
+    drawTextScreen('Press P to resume', mainCanvasSize.scale(.5).add(vec2(0,50)), 22, rgb(.8,.8,1), 4, rgb(0,0,0));
+  }
+
+  if (gameOver) {
+    drawRectScreen(mainCanvasSize.scale(.5), vec2(mainCanvasSize.x, 200), rgb(0,0,0,.75));
+    drawTextScreen('GAME OVER', mainCanvasSize.scale(.5).add(vec2(0,-20)), 64, rgb(1,.35,.35), 8, rgb(0,0,0));
+    drawTextScreen('Press R to restart', mainCanvasSize.scale(.5).add(vec2(0,60)), 26, rgb(1,1,1), 4, rgb(0,0,0));
+  }
+}
+
+// Startup
+engineInit(gameInit, gameUpdate, gameUpdatePost, gameRender, gameRenderPost);
+</script>
+</body>
+</html>

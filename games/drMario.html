@@ -1,0 +1,797 @@
+<!DOCTYPE html><head>
+<title>LittleJS AI Starter Project</title>
+<meta charset=utf-8>
+</head><body>
+<script src="https://cdn.jsdelivr.net/npm/littlejsengine@1.17.11/dist/littlejs.js"></script>
+<script>
+'use strict';
+
+// engine settings
+debugWatermark = false; // Hide debug watermark in corner
+showEngineVersion = false; // Hide engine version console display
+
+// AI can use this class to make sound effects
+class SoundGenerator extends Sound
+{
+    constructor(params = {})
+    {
+        const {
+            volume = 1,        // Volume scale (percent)
+            randomness = .05,  // How much to randomize frequency (percent Hz)
+            frequency = 220,   // Frequency of sound (Hz)
+            attack = 0,        // Attack time, how fast sound starts (seconds)
+            release = .1,      // Release time, how fast sound fades out (seconds)
+            shapeCurve = 1,    // Squareness of wave (0=square, 1=normal, 2=pointy)
+            slide = 0,         // How much to slide frequency (kHz/s)
+            pitchJump = 0,     // Frequency of pitch jump (Hz)
+            pitchJumpTime = 0, // Time of pitch jump (seconds)
+            repeatTime = 0,    // Resets some parameters periodically (seconds)
+            noise = 0,         // How much random noise to add (percent)
+            bitCrush = 0,      // Resamples at a lower frequency in (samples*100)
+            delay = 0,         // Overlap sound with itself for reverb and flanger effects (seconds)
+        } = params;
+
+        super([volume, randomness, frequency, attack, 0, release, 0, shapeCurve, slide, 0, pitchJump, pitchJumpTime, repeatTime, noise, 0, bitCrush, delay, 1, 0, 0, 0]);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////////
+// Dr. Mario (tiny prototype)
+// - Grid based pill dropping
+// - Match 4+ of the same color horizontally/vertically to clear
+// - Clear all viruses to win
+
+const GRID_W = 8;
+const GRID_H = 16;
+
+const COLOR_LIST = [
+    rgb(0.95, 0.20, 0.20),
+    rgb(0.20, 0.45, 0.95),
+    rgb(0.95, 0.85, 0.25),
+];
+
+const COLOR_SHADOW = [
+    rgb(0.55, 0.08, 0.08),
+    rgb(0.08, 0.20, 0.55),
+    rgb(0.55, 0.50, 0.10),
+];
+
+// board cell: null | { kind:'virus'|'pill', c:int, linkId:int, linkDir:{x,y} | null }
+let board = [];
+let virusCount = 0;
+let score = 0;
+let level = 1;
+
+let active = null;        // {x,y,o,cA,cB}
+let nextPill = null;      // {cA,cB}
+let linkIdGen = 1;
+let state = 'play';       // play | gameover | win
+
+let fallCounter = 0;
+const FALL_FRAMES = 30;
+const SOFT_FALL_FRAMES = 3;
+
+// SFX
+const sfxMove   = new SoundGenerator({volume:.25, frequency:520, release:.03, randomness:.02});
+const sfxRotate = new SoundGenerator({volume:.35, frequency:720, release:.05, slide:-.4, randomness:.03});
+const sfxLock   = new SoundGenerator({volume:.35, frequency:180, release:.08, noise:.05, randomness:.02});
+const sfxClear  = new SoundGenerator({volume:.45, frequency:620, release:.12, pitchJump:220, pitchJumpTime:.02, randomness:.05});
+const sfxWin    = new SoundGenerator({volume:.55, frequency:440, attack:.01, release:.35, slide:.5, randomness:.01});
+const sfxLose   = new SoundGenerator({volume:.55, frequency:140, attack:.01, release:.40, slide:-.6, noise:.08, randomness:.02});
+
+function cellKey(x,y){ return x + ',' + y; }
+function inBounds(x,y){ return x>=0 && x<GRID_W && y>=0 && y<GRID_H; }
+
+function getCell(x,y){ return inBounds(x,y) ? board[y*GRID_W + x] : {blocked:true}; }
+function setCell(x,y,v){ if (inBounds(x,y)) board[y*GRID_W + x] = v; }
+function isEmpty(x,y){ return inBounds(x,y) && !getCell(x,y); }
+
+function relFromOrient(o)
+{
+    // grid: y increases downward
+    if (o==0) return {x:1,y:0};
+    if (o==1) return {x:0,y:1};
+    if (o==2) return {x:-1,y:0};
+    return {x:0,y:-1}; // o==3
+}
+
+function gridToWorld(x,y)
+{
+    // center grid at (0,0) in world; LittleJS y increases up
+    const cx = (GRID_W/2 - .5);
+    const cy = (GRID_H/2 - .5);
+    return vec2(
+        x - cx,
+        (GRID_H - 1 - y) - cy
+    );
+}
+
+function randColorIndex()
+{
+    return randInt(0, COLOR_LIST.length);
+}
+
+function makeNextPill()
+{
+    nextPill = {cA: randColorIndex(), cB: randColorIndex()};
+}
+
+function spawnPill()
+{
+    if (!nextPill) makeNextPill();
+    active = {
+        x: Math.floor(GRID_W/2) - 1,
+        y: 0,
+        o: 0,
+        cA: nextPill.cA,
+        cB: nextPill.cB,
+    };
+    makeNextPill();
+
+    if (!canPlace(active.x, active.y, active.o))
+    {
+        active = null;
+        setState('gameover');
+    }
+}
+
+function canPlace(x,y,o)
+{
+    const r = relFromOrient(o);
+    const ax=x, ay=y;
+    const bx=x+r.x, by=y+r.y;
+    return isEmpty(ax,ay) && isEmpty(bx,by);
+}
+
+function tryMove(dx,dy)
+{
+    if (!active) return false;
+    const nx = active.x + dx;
+    const ny = active.y + dy;
+    if (canPlace(nx, ny, active.o))
+    {
+        active.x = nx;
+        active.y = ny;
+        sfxMove.play();
+        return true;
+    }
+    return false;
+}
+
+function tryRotate(dir=1)
+{
+    if (!active) return false;
+    const o2 = (active.o + (dir>0?1:3)) & 3;
+
+    const kicks = [
+        {x:0,y:0},
+        {x:1,y:0},
+        {x:-1,y:0},
+        {x:0,y:-1},
+        {x:0,y:1},
+        {x:2,y:0},
+        {x:-2,y:0},
+    ];
+
+    for (const k of kicks)
+    {
+        const nx = active.x + k.x;
+        const ny = active.y + k.y;
+        if (canPlace(nx, ny, o2))
+        {
+            active.x = nx;
+            active.y = ny;
+            active.o = o2;
+            sfxRotate.play();
+            return true;
+        }
+    }
+    return false;
+}
+
+function hardDrop()
+{
+    if (!active) return;
+    while (tryMove(0,1)) {}
+    lockActive();
+}
+
+function lockActive()
+{
+    if (!active) return;
+    const r = relFromOrient(active.o);
+    const ax=active.x, ay=active.y;
+    const bx=ax+r.x, by=ay+r.y;
+    const id = linkIdGen++;
+
+    const aDir = {x:r.x, y:r.y};
+    const bDir = {x:-r.x, y:-r.y};
+
+    setCell(ax, ay, {kind:'pill', c:active.cA, linkId:id, linkDir:aDir});
+    setCell(bx, by, {kind:'pill', c:active.cB, linkId:id, linkDir:bDir});
+    active = null;
+
+    sfxLock.play();
+
+    resolveBoard();
+
+    if (state === 'play')
+        spawnPill();
+}
+
+function unlinkOtherHalf(x,y,cell)
+{
+    if (!cell || cell.kind !== 'pill' || !cell.linkDir) return;
+    const ox = x + cell.linkDir.x;
+    const oy = y + cell.linkDir.y;
+    const other = getCell(ox,oy);
+    if (other && other.kind === 'pill' && other.linkId === cell.linkId)
+    {
+        other.linkDir = null;
+        other.linkId = 0;
+        setCell(ox,oy,other);
+    }
+}
+
+function findMatches()
+{
+    const toClear = new Set();
+
+    // rows
+    for (let y=0; y<GRID_H; y++)
+    {
+        let runColor = -1;
+        let runStart = 0;
+        let runLen = 0;
+        for (let x=0; x<=GRID_W; x++)
+        {
+            const cell = x<GRID_W ? getCell(x,y) : null;
+            const c = cell ? cell.c : -1;
+            if (c !== runColor)
+            {
+                if (runLen >= 4 && runColor >= 0)
+                    for (let rx=runStart; rx<runStart+runLen; rx++) toClear.add(cellKey(rx,y));
+                runColor = c;
+                runStart = x;
+                runLen = cell ? 1 : 0;
+            }
+            else
+                runLen++;
+        }
+    }
+
+    // cols
+    for (let x=0; x<GRID_W; x++)
+    {
+        let runColor = -1;
+        let runStart = 0;
+        let runLen = 0;
+        for (let y=0; y<=GRID_H; y++)
+        {
+            const cell = y<GRID_H ? getCell(x,y) : null;
+            const c = cell ? cell.c : -1;
+            if (c !== runColor)
+            {
+                if (runLen >= 4 && runColor >= 0)
+                    for (let ry=runStart; ry<runStart+runLen; ry++) toClear.add(cellKey(x,ry));
+                runColor = c;
+                runStart = y;
+                runLen = cell ? 1 : 0;
+            }
+            else
+                runLen++;
+        }
+    }
+
+    return toClear;
+}
+
+function applyClears(toClear)
+{
+    if (!toClear.size) return 0;
+    let clearedViruses = 0;
+
+    for (const k of toClear)
+    {
+        const [xs,ys] = k.split(',');
+        const x = xs|0, y = ys|0;
+        const cell = getCell(x,y);
+        if (!cell) continue;
+
+        if (cell.kind === 'virus')
+            clearedViruses++;
+
+        if (cell.kind === 'pill')
+            unlinkOtherHalf(x,y,cell);
+
+        setCell(x,y,null);
+    }
+
+    virusCount -= clearedViruses;
+    score += clearedViruses*100 + (toClear.size-clearedViruses)*10;
+
+    sfxClear.play();
+    return toClear.size;
+}
+
+function applyGravityOnce()
+{
+    let moved = false;
+
+    // move from bottom-1 up so things fall cleanly
+    for (let y=GRID_H-2; y>=0; y--)
+    for (let x=0; x<GRID_W; x++)
+    {
+        const cell = getCell(x,y);
+        if (!cell || cell.kind !== 'pill') continue;
+
+        // if linked, only process "root" cell
+        if (cell.linkDir)
+        {
+            const ox = x + cell.linkDir.x;
+            const oy = y + cell.linkDir.y;
+            const other = getCell(ox,oy);
+            if (!other || other.kind !== 'pill' || other.linkId !== cell.linkId)
+            {
+                // stale link; treat as single
+                cell.linkDir = null;
+                cell.linkId = 0;
+                setCell(x,y,cell);
+            }
+            else
+            {
+                // canonical root: smallest (y, then x)
+                const isRoot = (y < oy) || (y === oy && x < ox);
+                if (!isRoot) continue;
+
+                const belowA = {x:x, y:y+1};
+                const belowB = {x:ox, y:oy+1};
+
+                if (cell.linkDir.y !== 0)
+                {
+                    // vertical pair: only need below the lower half
+                    const lower = y > oy ? {x:x,y:y} : {x:ox,y:oy};
+                    if (isEmpty(lower.x, lower.y+1))
+                    {
+                        const a = getCell(x,y);
+                        const b = getCell(ox,oy);
+                        setCell(x,y,null);
+                        setCell(ox,oy,null);
+                        setCell(x,y+1,a);
+                        setCell(ox,oy+1,b);
+                        moved = true;
+                    }
+                }
+                else
+                {
+                    // horizontal pair: need both below empty
+                    if (isEmpty(belowA.x, belowA.y) && isEmpty(belowB.x, belowB.y))
+                    {
+                        const a = getCell(x,y);
+                        const b = getCell(ox,oy);
+                        setCell(x,y,null);
+                        setCell(ox,oy,null);
+                        setCell(x,y+1,a);
+                        setCell(ox,oy+1,b);
+                        moved = true;
+                    }
+                }
+                continue;
+            }
+        }
+
+        // single pill half
+        if (!cell.linkDir)
+        {
+            if (isEmpty(x,y+1))
+            {
+                setCell(x,y,null);
+                setCell(x,y+1,cell);
+                moved = true;
+            }
+        }
+    }
+
+    return moved;
+}
+
+function settleGravity()
+{
+    let any = false;
+    while (applyGravityOnce()) any = true;
+    return any;
+}
+
+function resolveBoard()
+{
+    while (true)
+    {
+        const matches = findMatches();
+        if (!matches.size) break;
+        applyClears(matches);
+        settleGravity();
+    }
+
+    if (virusCount <= 0)
+        setState('win');
+}
+
+function setState(s)
+{
+    if (state === s) return;
+    state = s;
+    if (s === 'win') sfxWin.play();
+    if (s === 'gameover') sfxLose.play();
+}
+
+function newGame()
+{
+    board = new Array(GRID_W*GRID_H).fill(null);
+    score = 0;
+    linkIdGen = 1;
+
+    // basic "level" scaling
+    const virusTarget = 8 + level*3;
+    virusCount = 0;
+
+    // place viruses in lower area
+    let tries = 0;
+    while (virusCount < virusTarget && tries++ < 10000)
+    {
+        const x = randInt(0, GRID_W);
+        const y = randInt(Math.floor(GRID_H*0.45), GRID_H);
+        if (!isEmpty(x,y)) continue;
+        const c = randColorIndex();
+        setCell(x,y,{kind:'virus', c, linkId:0, linkDir:null});
+        virusCount++;
+    }
+
+    active = null;
+    nextPill = null;
+    makeNextPill();
+    spawnPill();
+    fallCounter = 0;
+    state = 'play';
+}
+
+function runSelfTests()
+{
+    // lightweight sanity checks (non-fatal unless asserts are enabled)
+    console.assert(relFromOrient(0).x===1 && relFromOrient(0).y===0, 'relFromOrient(0)');
+    console.assert(relFromOrient(1).x===0 && relFromOrient(1).y===1, 'relFromOrient(1)');
+    console.assert(relFromOrient(2).x===-1 && relFromOrient(2).y===0, 'relFromOrient(2)');
+    console.assert(relFromOrient(3).x===0 && relFromOrient(3).y===-1, 'relFromOrient(3)');
+
+    const save = board;
+    board = new Array(GRID_W*GRID_H).fill(null);
+
+    // test horizontal match of 4
+    for (let i=0;i<4;i++)
+        setCell(i, GRID_H-1, {kind:'pill', c:1, linkId:0, linkDir:null});
+    let m = findMatches();
+    console.assert(m.size===4, 'findMatches horizontal 4');
+
+    // test vertical match of 4
+    board = new Array(GRID_W*GRID_H).fill(null);
+    for (let i=0;i<4;i++)
+        setCell(0, GRID_H-1-i, {kind:'pill', c:2, linkId:0, linkDir:null});
+    m = findMatches();
+    console.assert(m.size===4, 'findMatches vertical 4');
+
+    // test that applyClears unlinks partner
+    board = new Array(GRID_W*GRID_H).fill(null);
+    setCell(0, GRID_H-1, {kind:'pill', c:0, linkId:7, linkDir:{x:1,y:0}});
+    setCell(1, GRID_H-1, {kind:'pill', c:0, linkId:7, linkDir:{x:-1,y:0}});
+    const s = new Set([cellKey(0, GRID_H-1)]);
+    applyClears(s);
+    console.assert(getCell(1, GRID_H-1) && getCell(1, GRID_H-1).linkDir === null, 'applyClears unlinks other half');
+
+    board = save;
+}
+
+///////////////////////////////////////////////////////////////////////////////////
+function gameInit()
+{
+    // fixed canvas + camera
+    setCanvasFixedSize(vec2(960, 720));
+    setCameraScale(32);
+    setCameraPos(vec2(0,0));
+
+    runSelfTests();
+    newGame();
+}
+
+///////////////////////////////////////////////////////////////////////////////////
+function gameUpdate()
+{
+    if (keyWasPressed('KeyR'))
+        newGame();
+
+    if (state !== 'play')
+        return;
+
+    if (!active)
+        return;
+
+    // input
+    if (frame%4==0)
+    {
+        if (keyIsDown('ArrowLeft'))  tryMove(-1,0);
+        if (keyIsDown('ArrowRight')) tryMove(1,0);
+    }
+
+    if (keyWasPressed('ArrowUp') || keyWasPressed('KeyX'))
+        tryRotate(1);
+    if (keyWasPressed('KeyZ'))
+        tryRotate(-1);
+
+    if (keyWasPressed('Space'))
+        hardDrop();
+
+    // fall
+    const soft = keyIsDown('ArrowDown');
+    const frames = soft ? SOFT_FALL_FRAMES : FALL_FRAMES;
+    if (++fallCounter >= frames)
+    {
+        fallCounter = 0;
+        if (!tryMove(0,1))
+            lockActive();
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////////
+function gameUpdatePost()
+{
+    // keep camera fixed
+    setCameraPos(vec2(0,0));
+}
+
+function drawRotationGizmo(pivotPos, otherPos)
+{
+    // subtle connector + arrow toward the non-pivot half
+    drawLine(pivotPos, otherPos, 0.06, rgb(1,1,1,0.22));
+
+    const dx = otherPos.x - pivotPos.x;
+    const dy = otherPos.y - pivotPos.y;
+    const len = Math.max(0.001, Math.hypot(dx,dy));
+    const ux = dx/len;
+    const uy = dy/len;
+    const nx = -uy;
+    const ny = ux;
+
+    const back = vec2(otherPos.x - ux*0.28, otherPos.y - uy*0.28);
+    const a1 = vec2(back.x + nx*0.14, back.y + ny*0.14);
+    const a2 = vec2(back.x - nx*0.14, back.y - ny*0.14);
+    drawLine(otherPos, a1, 0.06, rgb(1,1,1,0.22));
+    drawLine(otherPos, a2, 0.06, rgb(1,1,1,0.22));
+}
+
+function gameRender()
+{
+    // background
+    drawRect(cameraPos, vec2(40, 26), rgb(0.08,0.08,0.10));
+
+    // bottle-ish frame
+    const frameSize = vec2(GRID_W + 2.2, GRID_H + 2.2);
+    drawRect(vec2(0,0), frameSize, rgb(0.18,0.20,0.25));
+    drawRect(vec2(0,0), vec2(GRID_W + 0.6, GRID_H + 0.6), rgb(0.05,0.05,0.06));
+
+    // subtle grid
+    for (let x=0; x<=GRID_W; x++)
+    {
+        const pA = gridToWorld(x-.5, 0-.5);
+        const pB = gridToWorld(x-.5, GRID_H-.5);
+        drawLine(pA, pB, 0.03, rgb(1,1,1,0.05));
+    }
+    for (let y=0; y<=GRID_H; y++)
+    {
+        const pA = gridToWorld(0-.5, y-.5);
+        const pB = gridToWorld(GRID_W-.5, y-.5);
+        drawLine(pA, pB, 0.03, rgb(1,1,1,0.05));
+    }
+
+    // board cells
+    for (let y=0; y<GRID_H; y++)
+    for (let x=0; x<GRID_W; x++)
+    {
+        const cell = getCell(x,y);
+        if (!cell) continue;
+        drawCellShape(cell, gridToWorld(x,y));
+    }
+
+    // active pill (pivot = A half at active.x,active.y)
+    if (state === 'play' && active)
+    {
+        const r = relFromOrient(active.o);
+        const aPos = gridToWorld(active.x, active.y);
+        const bPos = gridToWorld(active.x + r.x, active.y + r.y);
+
+        // draw rotation gizmo first so pills sit on top
+        drawRotationGizmo(aPos, bPos);
+
+        drawCellShape({kind:'pill', c:active.cA, linkDir:{x:r.x,y:r.y}, linkId:1}, aPos, {pivot:true});
+        drawCellShape({kind:'pill', c:active.cB, linkDir:{x:-r.x,y:-r.y}, linkId:1}, bPos);
+    }
+
+    // next preview
+    const uiX = (GRID_W/2 + 3.6);
+    const uiY = (GRID_H/2 - 1.0);
+    drawText('NEXT', vec2(uiX, uiY+1.4), 0.9, hsl(0,0,1), 0.15, hsl(0,0,0));
+    if (nextPill)
+    {
+        drawCellShape({kind:'pill', c:nextPill.cA, linkDir:{x:1,y:0}, linkId:1}, vec2(uiX-0.6, uiY));
+        drawCellShape({kind:'pill', c:nextPill.cB, linkDir:{x:-1,y:0}, linkId:1}, vec2(uiX+0.4, uiY));
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////////
+function gameRenderPost()
+{
+    const top = 54;
+    const centerX = mainCanvasSize.x/2;
+
+    drawTextScreen('DR. MINI (no sprites)', vec2(centerX, top), 36, hsl(0.58,0.25,0.85), 4, hsl(0,0,0));
+
+    const info = [
+        `Viruses: ${Math.max(0, virusCount)}   Score: ${score}   Level: ${level}`,
+        'Arrows = Move  |  Down = Soft drop  |  Up/X = Rotate  |  Z = Rotate CCW  |  Space = Hard drop  |  R = Restart',
+        'Goal: Clear all viruses (match 4+ same color in a row/col).'
+    ];
+
+    drawTextScreen(info[0], vec2(centerX, top+40), 26, hsl(0,0,1), 3, hsl(0,0,0));
+    drawTextScreen(info[1], vec2(centerX, top+70), 18, hsl(0,0,1), 3, hsl(0,0,0));
+    drawTextScreen(info[2], vec2(centerX, top+96), 18, hsl(0,0,1), 3, hsl(0,0,0));
+
+    if (state === 'win')
+    {
+        drawTextScreen('YOU WIN!  (Press R)', vec2(centerX, mainCanvasSize.y/2), 64, hsl(0.35,0.9,0.6), 6, hsl(0,0,0));
+    }
+    else if (state === 'gameover')
+    {
+        drawTextScreen('GAME OVER  (Press R)', vec2(centerX, mainCanvasSize.y/2), 64, hsl(0,0.8,0.6), 6, hsl(0,0,0));
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////////
+// Startup LittleJS Engine
+//
+function drawCellShape(cell, worldPos, opts={})
+{
+    const c = COLOR_LIST[cell.c];
+    const s = COLOR_SHADOW[cell.c];
+
+    if (cell.kind === 'virus')
+    {
+        drawCircle(worldPos, 0.82, c, 0.12, hsl(0,0,0));
+        drawCircle(worldPos.add(vec2(-0.20, 0.10)), 0.14, hsl(0,0,0));
+        drawCircle(worldPos.add(vec2( 0.20, 0.10)), 0.14, hsl(0,0,0));
+        drawCircle(worldPos.add(vec2(-0.10, 0.22)), 0.18, rgb(1,1,1,0.18));
+        return;
+    }
+
+    const thickness = 0.74;
+    const r = thickness * 0.5;
+    const outline = rgb(0,0,0,0.38);
+
+    // convert link dir (grid y down) -> world y up
+    const wdir = cell.linkDir ? vec2(cell.linkDir.x, -cell.linkDir.y) : vec2(0,0);
+
+    function drawHalf(axisH, toOtherSign)
+    {
+        // other half toward +sign, rounded end toward -sign
+        const roundedAtNeg = toOtherSign > 0;
+
+        const edge = 0.50;
+        const edge2 = 0.54;
+        const t2 = thickness + 0.10;
+        const r2 = r + 0.06;
+
+        if (axisH)
+        {
+            const cc  = roundedAtNeg ? -edge  + r  :  edge  - r;
+            const cc2 = roundedAtNeg ? -edge2 + r2 :  edge2 - r2;
+
+            const rectMin  = roundedAtNeg ? cc  : -edge;
+            const rectMax  = roundedAtNeg ? edge:  cc;
+            const rectMin2 = roundedAtNeg ? cc2 : -edge2;
+            const rectMax2 = roundedAtNeg ? edge2: cc2;
+
+            const rectLen  = rectMax  - rectMin;
+            const rectLen2 = rectMax2 - rectMin2;
+            const rectCenter  = (rectMin  + rectMax ) * 0.5;
+            const rectCenter2 = (rectMin2 + rectMax2) * 0.5;
+
+            // outline
+            drawRect(worldPos.add(vec2(rectCenter2, 0)), vec2(rectLen2, t2), outline);
+            drawCircle(worldPos.add(vec2(cc2, 0)), r2, outline);
+
+            // fill
+            drawRect(worldPos.add(vec2(rectCenter, 0)), vec2(rectLen, thickness), c);
+            drawCircle(worldPos.add(vec2(cc, 0)), r*2, c);
+
+            // shading + seam on flat side
+            drawRect(worldPos.add(vec2(rectCenter, 0)).add(vec2(-0.05, 0.06)), vec2(rectLen*0.98, thickness*0.90), rgb(s.r, s.g, s.b, 0.18));
+            const seamX = roundedAtNeg ? edge - 0.02 : -edge + 0.02;
+            drawRect(worldPos.add(vec2(seamX, 0)), vec2(0.08, thickness*0.90), rgb(0,0,0,0.25));
+            drawCircle(worldPos.add(vec2(cc, 0)).add(vec2(-0.10, 0.12)), r*0.35, rgb(1,1,1,0.30));
+        }
+        else
+        {
+            const cc  = roundedAtNeg ? -edge  + r  :  edge  - r;
+            const cc2 = roundedAtNeg ? -edge2 + r2 :  edge2 - r2;
+
+            const rectMin  = roundedAtNeg ? cc  : -edge;
+            const rectMax  = roundedAtNeg ? edge:  cc;
+            const rectMin2 = roundedAtNeg ? cc2 : -edge2;
+            const rectMax2 = roundedAtNeg ? edge2: cc2;
+
+            const rectLen  = rectMax  - rectMin;
+            const rectLen2 = rectMax2 - rectMin2;
+            const rectCenter  = (rectMin  + rectMax ) * 0.5;
+            const rectCenter2 = (rectMin2 + rectMax2) * 0.5;
+
+            // outline
+            drawRect(worldPos.add(vec2(0, rectCenter2)), vec2(t2, rectLen2), outline);
+            drawCircle(worldPos.add(vec2(0, cc2)), r2, outline);
+
+            // fill
+            drawRect(worldPos.add(vec2(0, rectCenter)), vec2(thickness, rectLen), c);
+            drawCircle(worldPos.add(vec2(0, cc)), r*2, c);
+
+            // shading + seam
+            drawRect(worldPos.add(vec2(0, rectCenter)).add(vec2(-0.05, 0.06)), vec2(thickness*0.90, rectLen*0.98), rgb(s.r, s.g, s.b, 0.18));
+            const seamY = roundedAtNeg ? edge - 0.02 : -edge + 0.02;
+            drawRect(worldPos.add(vec2(0, seamY)), vec2(thickness*0.90, 0.08), rgb(0,0,0,0.25));
+            drawCircle(worldPos.add(vec2(0, cc)).add(vec2(-0.10, 0.12)), r*0.35, rgb(1,1,1,0.30));
+        }
+    }
+
+    function drawFullCapsule()
+    {
+        const edge = 0.50;
+        const edge2 = 0.54;
+        const t2 = thickness + 0.10;
+        const r2 = r + 0.06;
+
+        const ccL  = -edge  + r;
+        const ccR  =  edge  - r;
+        const ccL2 = -edge2 + r2;
+        const ccR2 =  edge2 - r2;
+        const rectLen  = ccR  - ccL;
+        const rectLen2 = ccR2 - ccL2;
+
+        drawRect(worldPos, vec2(rectLen2, t2), outline);
+        drawCircle(worldPos.add(vec2(ccL2,0)), r2, outline);
+        drawCircle(worldPos.add(vec2(ccR2,0)), r2, outline);
+
+        drawRect(worldPos, vec2(rectLen, thickness), c);
+        drawCircle(worldPos.add(vec2(ccL,0)), r*2, c);
+        drawCircle(worldPos.add(vec2(ccR,0)), r*2, c);
+
+        drawCircle(worldPos.add(vec2(-0.18, 0.14)), r*0.30, rgb(1,1,1,0.25));
+    }
+
+    if (cell.linkDir)
+    {
+        if (Math.abs(wdir.x) > 0)
+            drawHalf(true, Math.sign(wdir.x));
+        else
+            drawHalf(false, Math.sign(wdir.y));
+    }
+    else
+        drawFullCapsule();
+
+    // pivot marker (shows what this pill rotates around)
+    if (opts.pivot)
+    {
+        drawCircle(worldPos, 0.18, rgb(1,1,1,0.75));
+        drawCircle(worldPos, 0.10, rgb(0,0,0,0.45));
+        drawLine(worldPos.add(vec2(-0.18,0)), worldPos.add(vec2(0.18,0)), 0.03, rgb(1,1,1,0.55));
+        drawLine(worldPos.add(vec2(0,-0.18)), worldPos.add(vec2(0,0.18)), 0.03, rgb(1,1,1,0.55));
+    }
+}
+
+engineInit(gameInit, gameUpdate, gameUpdatePost, gameRender, gameRenderPost);
+
+</script>
+</body>

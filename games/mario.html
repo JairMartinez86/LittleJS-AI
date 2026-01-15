@@ -1,0 +1,619 @@
+<!DOCTYPE html><head>
+<title>LittleJS AI Starter Project</title>
+<meta charset=utf-8>
+</head><body>
+<script src="https://cdn.jsdelivr.net/npm/littlejsengine@1.17.11/dist/littlejs.js"></script>
+<script>
+'use strict';
+
+// engine settings
+debugWatermark = false; // Hide debug watermark in corner
+showEngineVersion = false; // Hide engine version console display
+
+// AI can use this class to make sound effects
+class SoundGenerator extends Sound 
+{
+    constructor(params = {})
+    {
+        const {
+            volume = 1,        // Volume scale (percent)
+            randomness = .05,  // How much to randomize frequency (percent Hz)
+            frequency = 220,   // Frequency of sound (Hz)
+            attack = 0,        // Attack time, how fast sound starts (seconds)
+            release = .1,      // Release time, how fast sound fades out (seconds)
+            shapeCurve = 1,    // Squarenes of wave (0=square, 1=normal, 2=pointy)
+            slide = 0,         // How much to slide frequency (kHz/s)
+            pitchJump = 0,     // Frequency of pitch jump (Hz)
+            pitchJumpTime = 0, // Time of pitch jump (seconds)
+            repeatTime = 0,    // Resets some parameters periodically (seconds)
+            noise = 0,         // How much random noise to add (percent)
+            bitCrush = 0,      // Resamples at a lower frequency in (samples*100)
+            delay = 0,         // Overlap sound with itself for reverb and flanger effects (seconds)
+        } = params;
+        
+        super([volume, randomness, frequency, attack, 0, release, 0, shapeCurve, slide, 0, pitchJump, pitchJumpTime, repeatTime, noise, 0, bitCrush, delay, 1, 0, 0, 0]);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Minimal NES-style platformer level (original layout, inspired by early 8-bit platformers)
+// No textures/assets; everything is drawn with solid-color primitives.
+
+// --------- level data ---------
+const TILE = 1;
+const LEVEL_W = 240;
+const LEVEL_H = 18;
+
+// tile types
+const TT = {
+    EMPTY: 0,
+    GROUND: 1,
+    BRICK: 2,    PIPE: 4,
+    GOAL: 5,
+};
+
+const tileMap = new Map(); // key "x,y" -> type
+const tileKey = (x, y) => `${x|0},${y|0}`;
+
+function setTile(x, y, t)
+{
+    if (x < 0 || y < 0 || x >= LEVEL_W || y >= LEVEL_H) return;
+    if (t === TT.EMPTY) tileMap.delete(tileKey(x,y));
+    else tileMap.set(tileKey(x,y), t);
+}
+
+function getTile(x, y)
+{ return tileMap.get(tileKey(x,y)) || TT.EMPTY; }
+
+function isSolidType(t)
+{ return t === TT.GROUND || t === TT.BRICK || t === TT.PIPE || t === TT.GOAL; }
+
+function isSolidAt(x, y)
+{ return isSolidType(getTile(x,y)); }
+
+function fillRectTiles(x0, y0, w, h, t)
+{
+    for (let x = x0; x < x0 + w; x++)
+    for (let y = y0; y < y0 + h; y++)
+        setTile(x, y, t);
+}
+
+function clearRectTiles(x0, y0, w, h)
+{
+    for (let x = x0; x < x0 + w; x++)
+    for (let y = y0; y < y0 + h; y++)
+        setTile(x, y, TT.EMPTY);
+}
+
+function buildLevel()
+{
+    tileMap.clear();
+
+    // base ground
+    for (let x = 0; x < LEVEL_W; x++)
+        setTile(x, 0, TT.GROUND);
+
+    // a few pits (keep it "classic" but not an exact 1-1 layout)
+    const pits = [
+        [24, 3],
+        [58, 4],
+        [92, 3],
+        [132, 5],
+        [176, 4],
+    ];
+    for (const [start, len] of pits)
+        clearRectTiles(start, 0, len, 2);
+
+    // low hills
+    fillRectTiles(8, 1, 6, 2, TT.GROUND);
+    fillRectTiles(14, 1, 5, 1, TT.GROUND);
+
+    fillRectTiles(70, 1, 10, 2, TT.GROUND);
+    fillRectTiles(82, 1, 7, 1, TT.GROUND);
+
+    // brick / question clusters
+    const yA = 6;
+    fillRectTiles(12, yA, 3, 1, TT.BRICK);
+    setTile(13, yA+1, TT.BRICK);
+
+    fillRectTiles(34, yA, 5, 1, TT.BRICK);
+    setTile(36, yA+1, TT.BRICK);
+
+    fillRectTiles(104, 7, 4, 1, TT.BRICK);
+    setTile(106, 8, TT.BRICK);
+
+    // pipes (2 tiles wide)
+    addPipe(40, 1, 3);
+    addPipe(112, 1, 4);
+    addPipe(150, 1, 5);
+
+    // a mid-air platform
+    fillRectTiles(120, 9, 10, 1, TT.BRICK);
+
+    // stair-ish blocks near the end
+    const stairX = 200;
+    for (let i=0; i<8; i++)
+        fillRectTiles(stairX+i, 1, 1, i+1, TT.BRICK);
+
+    // goal gate
+    addGoal(228, 1);
+
+    // trim: ensure spawn area is clear
+    clearRectTiles(0, 1, 6, 8);
+}
+
+function addPipe(x, y, height)
+{
+    // body
+    fillRectTiles(x, y, 2, height, TT.PIPE);
+    // top lip
+    setTile(x-1, y+height-1, TT.PIPE);
+    setTile(x+2, y+height-1, TT.PIPE);
+}
+
+function addGoal(x, y)
+{
+    // two posts and a top bar
+    for (let i=0; i<10; i++)
+    {
+        setTile(x, y+i, TT.GOAL);
+        setTile(x+4, y+i, TT.GOAL);
+    }
+    fillRectTiles(x, y+10, 5, 1, TT.GOAL);
+}
+
+// --------- player ---------
+let player;
+let cameraMinX = 0;
+
+// --------- coins ---------
+let coinsCollected = 0;
+let coinsTotal = 0;
+
+// Hand-authored coin placements (world/tile units)
+const coinPositions = [
+    [7.5, 3.8], [9.0, 4.8], [10.5, 5.8],
+    [14.5, 8.2], [15.8, 8.2],
+    [26.5, 4.8], [27.5, 5.8], [28.5, 6.8],
+    [43.0, 6.2], [45.0, 6.2],
+    [62.0, 4.4], [63.2, 5.2], [64.4, 6.0],
+    [93.5, 4.8], [95.0, 6.0],
+    [121.5, 11.2], [123.0, 11.2], [124.5, 11.2],
+    [134.2, 4.8], [135.4, 5.6], [136.6, 6.4],
+    [152.0, 7.8], [154.0, 7.8],
+    [181.0, 5.2], [182.2, 6.0],
+    [205.0, 8.5], [207.0, 10.0],
+];
+
+function spawnCoins()
+{
+    coinsCollected = 0;
+    coinsTotal = coinPositions.length;
+    for (const [x,y] of coinPositions)
+        new Coin(vec2(x,y));
+}
+
+// --------- UI ---------
+const restartButtonPos  = vec2(110, 40);
+const restartButtonSize = vec2(190, 48);
+
+// sfx
+const sfxJump  = new SoundGenerator({ volume:.6, frequency:420, attack:0, release:.12, slide:.05, randomness:.02 });
+const sfxBump  = new SoundGenerator({ volume:.4, frequency:160, attack:0, release:.08, shapeCurve:0.6, noise:.1 });
+const sfxWin   = new SoundGenerator({ volume:.5, frequency:330, attack:0, release:.25, pitchJump:220, pitchJumpTime:.08, slide:-.12 });
+const sfxCoin  = new SoundGenerator({ volume:.45, frequency:900, attack:0, release:.10, pitchJump:1200, pitchJumpTime:.02, randomness:.01, shapeCurve:1.6 });
+
+class Coin extends EngineObject
+{
+    constructor(pos)
+    {
+        super(pos, vec2(.55));
+        this.baseY = pos.y;
+        this.phase = rand(9e9);
+        this.setCollision(false, false, false, false);
+    }
+
+    updatePhysics() {}
+
+    update()
+    {
+        // float animation (no dt; fixed 60fps)
+        this.pos.y = this.baseY + wave(2, 1, time + this.phase) * .14;
+
+        // collect
+        if (!player) return;
+        const dx = abs(player.pos.x - this.pos.x);
+        const dy = abs(player.pos.y - this.pos.y);
+        if (dx < player.size.x*.5 + .30 && dy < player.size.y*.5 + .30)
+        {
+            coinsCollected++;
+            sfxCoin.play(this.pos);
+            this.destroy();
+        }
+    }
+
+    render()
+    {
+        // coin body
+        const wobble = wave(6, 1, time + this.phase) * .10;
+        drawEllipse(this.pos, vec2(.32 + wobble, .42), rgb(1, .88, .2));
+        // inner shine
+        drawEllipse(this.pos.add(vec2(-.06, .03)), vec2(.12, .22), rgb(1, 1, 1, .7));
+        // outline hint
+        drawEllipse(this.pos, vec2(.36 + wobble, .46), rgb(.55, .35, .05, .45));
+    }
+}
+
+class Player extends EngineObject
+{
+    constructor(pos)
+    {
+        super(pos, vec2(.82, .92));
+        this.vel = vec2();
+        this.onGround = false;
+        this.facing = 1;
+        this.won = false;
+        this.jumpHold = 0;
+        this.jumpHolding = false;
+        this.prevJumpDown = false;
+
+        // disable built-in physics/collision (we do custom tile collision)
+        this.setCollision(false, false, false, false);
+    }
+
+    updatePhysics() {} // prevent EngineObject.updatePhysics from moving us
+
+    update()
+    {
+        // controls
+        const left  = keyIsDown('ArrowLeft')  || keyIsDown('KeyA');
+        const right = keyIsDown('ArrowRight') || keyIsDown('KeyD');
+        const run   = keyIsDown('ShiftLeft')  || keyIsDown('KeyX');
+        const jumpDown = keyIsDown('Space') || keyIsDown('ArrowUp') || keyIsDown('KeyZ');
+        const jumpPressed = jumpDown && !this.prevJumpDown;
+        const jumpReleased = !jumpDown && this.prevJumpDown;
+
+        // movement tuning (per-frame values, engine is fixed 60fps)
+        const accel = run ? .045 : .032;
+        const maxSpeed = run ? .34 : .24;
+        const friction = this.onGround ? .78 : .92;
+        const gravity = .022;
+        const jumpVel = .46;
+        const jumpHoldFrames = 12;     // frames you can hold to gain extra height
+        const jumpHoldBoost  = .012;   // added upward velocity per frame while holding
+        const jumpCut        = .45;    // release early => reduce upward velocity
+
+        if (!this.won)
+        {
+            if (left)  { this.vel.x -= accel; this.facing = -1; }
+            if (right) { this.vel.x += accel; this.facing =  1; }
+
+            // friction when no input, or always a bit when on ground
+            if (!left && !right)
+                this.vel.x *= friction;
+
+            // clamp
+            this.vel.x = clamp(this.vel.x, -maxSpeed, maxSpeed);
+
+            // jump (variable height)
+            if (jumpPressed && this.onGround)
+            {
+                this.vel.y = jumpVel;
+                this.onGround = false;
+                this.jumpHolding = true;
+                this.jumpHold = jumpHoldFrames;
+                sfxJump.play(this.pos);
+            }
+
+            // hold to go higher (only while rising)
+            if (this.jumpHolding)
+            {
+                if (jumpDown && this.jumpHold > 0 && this.vel.y > 0)
+                {
+                    this.vel.y += jumpHoldBoost;
+                    this.jumpHold--;
+                }
+                else
+                    this.jumpHolding = false;
+            }
+
+            // short hop if released early
+            if (jumpReleased && this.vel.y > 0)
+            {
+                this.vel.y *= jumpCut;
+                this.jumpHolding = false;
+            }
+        }
+
+        // gravity
+        this.vel.y -= gravity;
+        this.vel.y = max(this.vel.y, -0.9);
+
+        // move + collide
+        this.moveAndCollide();
+
+        // goal check
+        if (!this.won)
+        {
+            const goalX = 230;
+            if (this.pos.x > goalX)
+            {
+                this.won = true;
+                sfxWin.play(this.pos);
+            }
+        }
+
+        // win celebration: little hop + slow
+        if (this.won)
+        {
+            this.vel.x *= .90;
+            if (this.onGround && randBool(.02))
+            {
+                this.vel.y = .38;
+                this.onGround = false;
+            }
+        }
+
+        // remember jump state for press/release logic
+        this.prevJumpDown = jumpDown;
+
+        // fell off
+        if (this.pos.y < -20)
+            respawn();
+    }
+
+    moveAndCollide()
+    {
+        const half = this.size.scale(.5);
+
+        // ---- X axis ----
+        this.pos.x += this.vel.x;
+        if (this.vel.x)
+        {
+            const y0 = floor(this.pos.y - half.y + .001);
+            const y1 = floor(this.pos.y + half.y - .001);
+
+            if (this.vel.x > 0)
+            {
+                const xSide = floor(this.pos.x + half.x);
+                for (let y = y0; y <= y1; y++)
+                if (isSolidAt(xSide, y))
+                {
+                    this.pos.x = xSide - half.x;
+                    this.vel.x = 0;
+                    break;
+                }
+            }
+            else
+            {
+                const xSide = floor(this.pos.x - half.x);
+                for (let y = y0; y <= y1; y++)
+                if (isSolidAt(xSide, y))
+                {
+                    this.pos.x = xSide + 1 + half.x;
+                    this.vel.x = 0;
+                    break;
+                }
+            }
+        }
+
+        // ---- Y axis ----
+        this.onGround = false;
+        this.pos.y += this.vel.y;
+        if (this.vel.y)
+        {
+            const x0 = floor(this.pos.x - half.x + .001);
+            const x1 = floor(this.pos.x + half.x - .001);
+
+            if (this.vel.y > 0)
+            {
+                const ySide = floor(this.pos.y + half.y);
+                for (let x = x0; x <= x1; x++)
+                if (isSolidAt(x, ySide))
+                {
+                    // bump head
+                    this.pos.y = ySide - half.y;
+                    this.vel.y = 0;
+                    sfxBump.play(this.pos);
+                    this.jumpHolding = false;
+                    this.jumpHold = 0;
+                    break;
+                }
+            }
+            else
+            {
+                const ySide = floor(this.pos.y - half.y);
+                for (let x = x0; x <= x1; x++)
+                if (isSolidAt(x, ySide))
+                {
+                    // landed
+                    this.pos.y = ySide + 1 + half.y;
+                    this.vel.y = 0;
+                    this.onGround = true;
+                    this.jumpHolding = false;
+                    this.jumpHold = 0;
+                    break;
+                }
+            }
+        }
+    }
+
+    render()
+    {
+        // body
+        const body = rgb(.95, .25, .25);
+        drawRect(this.pos, this.size, body);
+
+        // hat
+        const hatSize = vec2(this.size.x, this.size.y*.22);
+        const hatPos  = this.pos.add(vec2(0, this.size.y*.39));
+        drawRect(hatPos, hatSize, rgb(.65, .05, .05));
+
+        // face direction indicator
+        const eyePos = this.pos.add(vec2(this.facing*this.size.x*.18, this.size.y*.12));
+        drawRect(eyePos, vec2(.10,.10), rgb(1,1,1));
+    }
+}
+
+function respawn()
+{
+    engineObjectsDestroy(true);
+    buildLevel();
+    spawnCoins();
+    player = new Player(vec2(2.5, 3.2));
+    cameraMinX = 0;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameInit()
+{
+    // retro-ish fixed canvas (4:3) and pixelated rendering
+    setCanvasFixedSize(vec2(960, 720));
+    setCanvasPixelated(true);
+
+    // camera tuning
+    cameraScale = 60; // pixels per world unit (tile)
+
+    // input
+    inputWASDEmulateDirection = true;
+    touchGamepadEnable = true;
+    touchGamepadSize = 110;
+
+    // build + spawn
+    respawn();
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameUpdate()
+{
+    // restart hotkey
+    if (keyWasPressed('KeyR'))
+        respawn();
+
+    // restart button (mouse/touch)
+    if (mouseWasPressed(0))
+    {
+        const mp = mousePosScreen;
+        if (abs(mp.x - restartButtonPos.x) < restartButtonSize.x/2 &&
+            abs(mp.y - restartButtonPos.y) < restartButtonSize.y/2)
+        {
+            respawn();
+        }
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameUpdatePost()
+{
+    if (!player) return;
+
+    // follow camera; don't scroll backward
+    const camY = 6.0;
+    const targetX = max(player.pos.x, cameraMinX + 6);
+    cameraMinX = max(cameraMinX, targetX - 6);
+    setCameraPos(vec2(cameraMinX + 8, camY));
+
+    // clamp near end so we don't show too much past the goal
+    const camSize = getCameraSize();
+    const maxCamX = LEVEL_W - camSize.x/2;
+    if (cameraPos.x > maxCamX)
+        setCameraPos(vec2(maxCamX, camY));
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function drawTilePrimitive(x, y, t)
+{
+    const pos = vec2(x + .5, y + .5);
+
+    if (t === TT.GROUND)
+    {
+        drawRect(pos, vec2(1), rgb(.55, .35, .15));
+        // top highlight
+        drawRect(pos.add(vec2(0,.38)), vec2(1,.24), rgb(.65,.45,.22));
+    }
+    else if (t === TT.BRICK)
+    {
+        drawRect(pos, vec2(1), rgb(.62, .36, .18));
+        drawRect(pos.add(vec2(0,.32)), vec2(.9,.18), rgb(.72, .44, .22));
+        // a couple "mortar" lines
+        drawLine(pos.add(vec2(-.45, 0)), pos.add(vec2(.45, 0)), .06, rgb(.42,.25,.12));
+        drawLine(pos.add(vec2(0, -.45)), pos.add(vec2(0, .45)), .06, rgb(.42,.25,.12));
+    }
+    else if (t === TT.PIPE)
+    {
+        drawRect(pos, vec2(1), rgb(.18, .75, .28));
+        drawRect(pos.add(vec2(0,.38)), vec2(1,.24), rgb(.12,.55,.20));
+        drawRect(pos.add(vec2(-.30,0)), vec2(.18,1), rgb(.28,.90,.38));
+    }
+    else if (t === TT.GOAL)
+    {
+        drawRect(pos, vec2(1), rgb(.92, .92, .92));
+        drawRect(pos.add(vec2(0,.38)), vec2(1,.24), rgb(.75,.75,.75));
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameRender()
+{
+    // sky
+    const camSize = getCameraSize();
+    drawRect(cameraPos, camSize, rgb(.45, .72, .98));
+
+    // simple clouds/parallax
+    for (let i=0; i<6; i++)
+    {
+        const cx = cameraPos.x*.35 + i*10 + 3;
+        const cy = 10 + (i%3)*2 + wave(.3, 1, time+i)*.2;
+        drawRect(vec2(cx, cy), vec2(3.2, 1.1), rgb(1,1,1,.65));
+        drawRect(vec2(cx+1.2, cy+.4), vec2(2.6, .9), rgb(1,1,1,.65));
+    }
+
+    // draw visible tiles only
+    const minX = floor(cameraPos.x - camSize.x/2) - 2;
+    const maxX = floor(cameraPos.x + camSize.x/2) + 2;
+    const minY = -1;
+    const maxY = LEVEL_H + 2;
+
+    for (let y=minY; y<=maxY; y++)
+    for (let x=minX; x<=maxX; x++)
+    {
+        const t = getTile(x,y);
+        if (t) drawTilePrimitive(x, y, t);
+    }
+
+    // bushes (pure decoration)
+    for (let i=0; i<10; i++)
+    {
+        const bx = (i*18 + 6) - (cameraPos.x%18);
+        const by = 1.3;
+        drawEllipse(vec2(cameraPos.x - camSize.x/2 + bx, by), vec2(1.4, .7), rgb(.15,.68,.22));
+        drawEllipse(vec2(cameraPos.x - camSize.x/2 + bx + 1.2, by), vec2(1.2, .6), rgb(.12,.55,.18));
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameRenderPost()
+{
+    // HUD
+    const help = 'Arrow/A,D: Move   Space/Z/Up: Jump   Shift/X: Run   R: Restart';
+    drawTextScreen(help, vec2(mainCanvasSize.x/2, mainCanvasSize.y - 20), 20, hsl(0,0,1), 4, hsl(0,0,0));
+
+    // restart button
+    const hover = abs(mousePosScreen.x - restartButtonPos.x) < restartButtonSize.x/2 &&
+                  abs(mousePosScreen.y - restartButtonPos.y) < restartButtonSize.y/2;
+    drawRect(restartButtonPos, restartButtonSize, hover ? rgb(.2,.2,.2,.65) : rgb(.15,.15,.15,.55), 0, false, true);
+    drawRect(restartButtonPos, restartButtonSize.add(vec2(-6,-6)), rgb(.05,.05,.05,.35), 0, false, true);
+    drawTextScreen('RESTART', restartButtonPos, 22, rgb(1,1,1), 4, rgb(0,0,0));
+
+    // coins counter
+    drawTextScreen(`COINS ${coinsCollected}/${coinsTotal}`, vec2(mainCanvasSize.x - 140, 40), 26, rgb(1,1,1), 4, rgb(0,0,0), 'center', 'monospace');
+
+    if (player?.won)
+        drawTextScreen('GOAL!', vec2(mainCanvasSize.x/2, 70), 80, hsl(.12,.9,.65), 6, hsl(0,0,0));
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Startup LittleJS Engine
+engineInit(gameInit, gameUpdate, gameUpdatePost, gameRender, gameRenderPost);
+
+</script>

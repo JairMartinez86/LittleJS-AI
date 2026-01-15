@@ -1,0 +1,628 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <title>LittleJS – Centipede (prototype)</title>
+  <style>
+    /* LittleJS sets body styles too, but keeping this helps prevent page flash */
+    html, body { margin:0; padding:0; background:#000; overflow:hidden; }
+  </style>
+</head>
+<body>
+  <script src="https://cdn.jsdelivr.net/npm/littlejsengine@1.17.11/dist/littlejs.min.js"></script>
+  <script>
+  'use strict';
+
+  ///////////////////////////////////////////////////////////////////////////////
+  // Sound helper (from the LittleJS starter template)
+  class SoundGenerator extends Sound
+  {
+      constructor(params = {})
+      {
+          const {
+              volume = 1,
+              randomness = .05,
+              frequency = 220,
+              attack = 0,
+              release = .1,
+              shapeCurve = 1,
+              slide = 0,
+              pitchJump = 0,
+              pitchJumpTime = 0,
+              repeatTime = 0,
+              noise = 0,
+              bitCrush = 0,
+              delay = 0,
+          } = params;
+
+          super([volume, randomness, frequency, attack, 0, release, 0, shapeCurve, slide, 0, pitchJump, pitchJumpTime, repeatTime, noise, 0, bitCrush, delay, 1, 0, 0, 0]);
+      }
+  }
+
+  // SFX
+  const sShoot = new SoundGenerator({volume:.35, frequency:900, release:.05, shapeCurve:1.8, slide:-2});
+  const sHit   = new SoundGenerator({volume:.45, frequency:280, release:.08, shapeCurve:.9, noise:.12});
+  const sSplit = new SoundGenerator({volume:.55, frequency:160, release:.18, shapeCurve:.6, noise:.05});
+  const sDie   = new SoundGenerator({volume:.55, frequency:90,  release:.35, shapeCurve:.2, noise:.18, slide:-.5});
+
+  ///////////////////////////////////////////////////////////////////////////////
+  // Grid / game constants
+  const gridSize = vec2(40, 26);                  // cells
+  const levelSize = gridSize.copy();              // world units (1 unit == 1 cell)
+  const playerMinY = 1;                           // player center Y minimum
+  const playerMaxY = 4;                           // player can move up into this zone
+  const turnUpZoneY = 4;                          // when centipede hits obstacles near player, it tends to turn upward
+
+  const bulletSpeed = 22;                         // world units / second
+  const playerSpeed = 18;                         // world units / second
+
+  const mushroomHP = 4;
+  const mushroomCountBase = 42;
+
+  ///////////////////////////////////////////////////////////////////////////////
+  // Game state
+  let player;
+  let mushrooms;          // Map<key, Mushroom>
+  let centipedes;         // Array<CentipedeChain>
+  let segmentLookup;      // Map<key, {chain, index}>
+  let score, lives, level;
+  let gameOver, gameWon;
+
+  function cellKey(x, y) { return (x|0) + ',' + (y|0); }
+  function clampCell(c) { c.x = clamp(c.x|0, 0, gridSize.x-1); c.y = clamp(c.y|0, 0, gridSize.y-1); return c; }
+  function posToCell(pos) { return clampCell(vec2(pos.x|0, pos.y|0)); }
+  function cellCenter(cell) { return vec2(cell.x + .5, cell.y + .5); }
+
+  function inBoundsCell(cell)
+  {
+      return cell.x >= 0 && cell.x < gridSize.x && cell.y >= 0 && cell.y < gridSize.y;
+  }
+
+  ///////////////////////////////////////////////////////////////////////////////
+  // Render helpers (fake outline by drawing a slightly larger black rect first)
+  function drawOutlinedRect(pos, size, color, outline=rgb(0,0,0,.9))
+  {
+      drawRect(pos, size.add(vec2(.12)), outline);
+      drawRect(pos, size, color);
+  }
+
+  ///////////////////////////////////////////////////////////////////////////////
+  // Objects
+
+  class Player extends EngineObject
+  {
+      constructor()
+      {
+          super(vec2(levelSize.x/2, playerMinY + .5), vec2(1.2, .8));
+          this.setCollision(false, false, false, false);
+          this.cooldown = 0;
+      }
+      update()
+      {
+          // movement (keyboard, or mouse-follow when cursor is over the canvas)
+          const right = keyIsDown('ArrowRight') || keyIsDown('KeyD');
+          const left  = keyIsDown('ArrowLeft')  || keyIsDown('KeyA');
+          const up    = keyIsDown('ArrowUp')    || keyIsDown('KeyW');
+          const down  = keyIsDown('ArrowDown')  || keyIsDown('KeyS');
+
+          const move = vec2((right?1:0) - (left?1:0), (up?1:0) - (down?1:0));
+          const keyboardActive = move.lengthSquared() > 0;
+
+          if (keyboardActive)
+          {
+              // keyboard movement
+              this.pos = this.pos.add(move.normalize().scale(playerSpeed * timeDelta));
+          }
+          else
+          {
+              // mouse movement: go to the closest valid position to the mouse
+              const inCanvas =
+                  mousePosScreen.x >= 0 && mousePosScreen.y >= 0 &&
+                  mousePosScreen.x <= mainCanvasSize.x && mousePosScreen.y <= mainCanvasSize.y;
+
+              if (inCanvas)
+              {
+                  const target = vec2(
+                      clamp(mousePos.x, .6, levelSize.x - .6),
+                      clamp(mousePos.y, playerMinY + .5, playerMaxY + .5)
+                  );
+
+                  // move toward target (snappy but not teleport)
+                  const d = target.subtract(this.pos);
+                  const dist = d.length();
+                  if (dist > 0.0001)
+                  {
+                      const step = playerSpeed * 1.35 * timeDelta;
+                      this.pos = (dist <= step) ? target : this.pos.add(d.scale(step / dist));
+                  }
+              }
+          }
+
+          // clamp to player area
+          this.pos.x = clamp(this.pos.x, .6, levelSize.x - .6);
+          this.pos.y = clamp(this.pos.y, playerMinY + .5, playerMaxY + .5);
+
+          // shooting (hold to keep firing)
+          this.cooldown = max(0, this.cooldown - timeDelta);
+          const shooting = keyIsDown('Space') || mouseIsDown(0);
+          if (!gameOver && !gameWon && shooting && this.cooldown <= 0)
+          {
+              this.cooldown = .12;
+              new Bullet(this.pos.add(vec2(0, .7)));
+              sShoot.play(this.pos, 1, rand(-.08, .08));
+          }
+
+          // restart
+          if ((gameOver || gameWon) && (keyWasPressed('Enter') || keyWasPressed('Space') || mouseWasPressed(0)))
+              resetGame();
+      }
+
+      render()
+      {
+          // ship body
+          drawOutlinedRect(this.pos, this.size, rgb(.2,.9,1));
+
+          // barrel
+          drawOutlinedRect(this.pos.add(vec2(0, .55)), vec2(.22, .55), rgb(.2,.9,1));
+
+          // little cockpit
+          drawRect(this.pos.add(vec2(0, .05)), vec2(.55, .35), rgb(.1,.4,.5));
+      }
+  }
+
+  class Bullet extends EngineObject
+  {
+      constructor(pos)
+      {
+          super(pos, vec2(.18, .6));
+          this.setCollision(false, false, false, false);
+          this.velocity = vec2(0, bulletSpeed);
+          this.life = 1.3; // seconds
+          this.renderOrder = 10;
+      }
+
+      update()
+      {
+          // kill offscreen / after time
+          this.life -= timeDelta;
+          if (this.life <= 0 || this.pos.y > levelSize.y + 2)
+          {
+              this.destroy();
+              return;
+          }
+
+          // handle impacts using grid cell collision (fast + retro)
+          const cell = posToCell(this.pos);
+
+          // mushrooms
+          const m = mushrooms.get(cellKey(cell.x, cell.y));
+          if (m)
+          {
+              m.damage();
+              sHit.play(this.pos, 1, rand(-.1,.1));
+              this.destroy();
+              return;
+          }
+
+          // centipede segment
+          const hit = segmentLookup.get(cellKey(cell.x, cell.y));
+          if (hit)
+          {
+              hitSegment(hit.chain, hit.index, cell);
+              sSplit.play(this.pos, 1, rand(-.08,.08));
+              this.destroy();
+              return;
+          }
+      }
+
+      render()
+      {
+          drawRect(this.pos, this.size, rgb(1,1,.2));
+      }
+  }
+
+  class Mushroom extends EngineObject
+  {
+      constructor(cell)
+      {
+          super(cellCenter(cell), vec2(.9, .9));
+          this.setCollision(false, false, false, false);
+          this.cell = cell.copy();
+          this.hp = mushroomHP;
+          this.renderOrder = -5;
+      }
+
+      damage()
+      {
+          this.hp--;
+          if (this.hp <= 0)
+          {
+              mushrooms.delete(cellKey(this.cell.x, this.cell.y));
+              this.destroy();
+              score += 1;
+          }
+      }
+
+      render()
+      {
+          // tint based on hp
+          const t = 1 - (this.hp-1)/(mushroomHP-1);
+          const cap = rgb(.25 + .6*t, .75 - .25*t, .25);
+          const stem = rgb(.18 + .5*t, .55 - .2*t, .18);
+
+          // outline base
+          drawRect(this.pos, this.size.add(vec2(.12)), rgb(0,0,0,.9));
+
+          // cap
+          drawRect(this.pos.add(vec2(0, .18)), vec2(.9, .55), cap);
+          // stem
+          drawRect(this.pos.add(vec2(0, -.22)), vec2(.35, .55), stem);
+
+          // damage cracks (simple bars)
+          if (this.hp <= 3) drawRect(this.pos.add(vec2(-.2, .12)), vec2(.08, .45), rgb(0,0,0,.35));
+          if (this.hp <= 2) drawRect(this.pos.add(vec2(.18, .05)), vec2(.08, .55), rgb(0,0,0,.35));
+          if (this.hp <= 1) drawRect(this.pos.add(vec2(0, -.05)), vec2(.65, .07), rgb(0,0,0,.35));
+      }
+  }
+
+  class Segment extends EngineObject
+  {
+      constructor(cell, isHead=false)
+      {
+          super(cellCenter(cell), vec2(.9, .9));
+          this.setCollision(false, false, false, false);
+          this.cell = cell.copy();
+          this.isHead = isHead;
+          this.renderOrder = 0;
+      }
+
+      setCell(cell)
+      {
+          this.cell = cell.copy();
+          this.pos = cellCenter(cell);
+      }
+
+      render()
+      {
+          const base = this.isHead ? rgb(.95,.25,.4) : rgb(.35,.95,.45);
+          drawOutlinedRect(this.pos, this.size, base);
+
+          // little "legs" dots
+          drawRect(this.pos.add(vec2(-.3, -.35)), vec2(.12, .12), rgb(0,0,0,.35));
+          drawRect(this.pos.add(vec2(.3, -.35)),  vec2(.12, .12), rgb(0,0,0,.35));
+
+          // head eyes
+          if (this.isHead)
+          {
+              drawRect(this.pos.add(vec2(-.18, .12)), vec2(.14, .14), rgb(0,0,0,.75));
+              drawRect(this.pos.add(vec2(.18, .12)),  vec2(.14, .14), rgb(0,0,0,.75));
+          }
+      }
+  }
+
+  ///////////////////////////////////////////////////////////////////////////////
+  // Centipede chains (not EngineObjects themselves)
+
+  class CentipedeChain
+  {
+      constructor(cells, dirX=-1)
+      {
+          this.dirX = dirX;
+          this.stepTimer = 0;
+          this.stepEvery = max(.08, .14 - (level-1)*.01); // slightly faster each level
+
+          this.segments = cells.map((c,i)=> new Segment(c, i===0));
+      }
+
+      destroy()
+      {
+          for (const s of this.segments)
+              s.destroy();
+          this.segments.length = 0;
+      }
+
+      get length() { return this.segments.length; }
+
+      update(dt)
+      {
+          if (!this.segments.length) return;
+
+          this.stepTimer += dt;
+          while (this.stepTimer >= this.stepEvery)
+          {
+              this.stepTimer -= this.stepEvery;
+              this.stepOnce();
+          }
+      }
+
+      stepOnce()
+      {
+          if (!this.segments.length) return;
+
+          // head cell
+          const head = this.segments[0];
+          const hx = head.cell.x, hy = head.cell.y;
+
+          // try moving horizontally
+          const nx = hx + this.dirX;
+          const forwardCell = vec2(nx, hy);
+
+          const blockedByWall = nx < 0 || nx >= gridSize.x;
+          const blockedByMushroom = !blockedByWall && mushrooms.has(cellKey(forwardCell.x, forwardCell.y));
+
+          let newHeadCell;
+          if (blockedByWall || blockedByMushroom)
+          {
+              // turn: move vertically one row and reverse direction
+              this.dirX *= -1;
+              const stepY = (hy <= turnUpZoneY) ? +1 : -1; // near the player, tend to move upward instead
+              newHeadCell = vec2(hx, clamp(hy + stepY, 0, gridSize.y-1));
+          }
+          else
+              newHeadCell = forwardCell;
+
+          // shift body
+          for (let i=this.segments.length-1; i>0; --i)
+              this.segments[i].setCell(this.segments[i-1].cell);
+          head.setCell(newHeadCell);
+
+          // keep head flag on segment[0]
+          for (let i=0; i<this.segments.length; ++i)
+              this.segments[i].isHead = (i===0);
+      }
+
+      rebuildLookup(map)
+      {
+          for (let i=0; i<this.segments.length; ++i)
+          {
+              const c = this.segments[i].cell;
+              map.set(cellKey(c.x, c.y), {chain:this, index:i});
+          }
+      }
+  }
+
+  ///////////////////////////////////////////////////////////////////////////////
+  // Game setup
+
+  function resetGame()
+  {
+      engineObjectsDestroy();
+
+      mushrooms = new Map();
+      centipedes = [];
+      segmentLookup = new Map();
+
+      score = 0;
+      lives = 3;
+      level = 1;
+      gameOver = false;
+      gameWon = false;
+
+      // player
+      player = new Player();
+
+      spawnLevel();
+  }
+
+  function spawnLevel()
+  {
+      // clear any old level objects but keep player
+      for (const o of engineObjects)
+      {
+          if (o === player) continue;
+          o.destroy();
+      }
+
+      // rebuild maps
+      mushrooms.clear();
+      centipedes.length = 0;
+      segmentLookup.clear();
+
+      // spawn mushrooms
+      const avoidRadius2 = 16; // keep them away from the player start
+      const target = mushroomCountBase + (level-1)*6;
+      let tries = 0;
+      while (mushrooms.size < target && tries++ < target*40)
+      {
+          const cell = vec2(randInt(gridSize.x), randInt(gridSize.y-6) + 6); // mostly upper area
+          if (mushrooms.has(cellKey(cell.x, cell.y))) continue;
+
+          const d2 = cellCenter(cell).distanceSquared(vec2(levelSize.x/2, playerMinY + .5));
+          if (d2 < avoidRadius2) continue;
+
+          // avoid very top row so centipede has room
+          if (cell.y >= gridSize.y-1) continue;
+
+          const m = new Mushroom(cell);
+          mushrooms.set(cellKey(cell.x, cell.y), m);
+      }
+
+      // spawn a centipede chain across the top
+      const len = 12 + min(8, level*2);
+      const startY = gridSize.y - 2;
+      const startX = clamp((gridSize.x/2|0) - (len/2|0), 0, gridSize.x-len);
+      const cells = [];
+      for (let i=0; i<len; ++i)
+          cells.push(vec2(startX+i, startY));
+      centipedes.push(new CentipedeChain(cells, -1));
+
+      // reset player
+      player.pos = vec2(levelSize.x/2, playerMinY + .5);
+      player.cooldown = 0;
+
+      rebuildSegmentLookup();
+  }
+
+  function rebuildSegmentLookup()
+  {
+      segmentLookup.clear();
+      for (const c of centipedes)
+          c.rebuildLookup(segmentLookup);
+  }
+
+  function hitSegment(chain, index, cell)
+  {
+      // spawn a mushroom where it got hit (if empty)
+      const key = cellKey(cell.x, cell.y);
+      if (!mushrooms.has(key))
+      {
+          const m = new Mushroom(cell);
+          // mushrooms created from hits start partially damaged for variety
+          m.hp = 2 + randInt(3); // 2-4
+          mushrooms.set(key, m);
+      }
+
+      // score
+      score += 10;
+
+      // split centipede: remove the hit segment, tail becomes a new chain
+      const tail = chain.segments.splice(index + 1);
+      const killed = chain.segments.splice(index, 1);
+      for (const s of killed) s.destroy();
+
+      // new chain from the tail
+      if (tail.length)
+      {
+          // re-home tail segments into a new chain (keep their cells)
+          const tailCells = tail.map(s=>s.cell.copy());
+          for (const s of tail) s.destroy();
+          centipedes.push(new CentipedeChain(tailCells, chain.dirX));
+      }
+
+      // if chain empty, remove it
+      if (!chain.length)
+          centipedes = centipedes.filter(c=>c !== chain);
+
+      rebuildSegmentLookup();
+
+      // win if no segments left
+      if (!centipedes.length)
+      {
+          gameWon = true;
+          level++;
+      }
+  }
+
+  function playerDie()
+  {
+      if (gameOver) return;
+      lives--;
+      sDie.play(player.pos, 1, rand(-.08,.08));
+
+      if (lives <= 0)
+      {
+          gameOver = true;
+          return;
+      }
+
+      // quick reset position
+      player.pos = vec2(levelSize.x/2, playerMinY + .5);
+      player.cooldown = .25;
+  }
+
+  ///////////////////////////////////////////////////////////////////////////////
+  // Engine callbacks
+
+  function gameInit()
+  {
+      debugShowErrors();
+
+      setShowSplashScreen(false);
+      setCanvasFixedSize(vec2(1280, 720));
+      setCameraScale(28);
+      setCameraPos(levelSize.scale(.5));
+
+      resetGame();
+  }
+
+  function gameUpdate()
+  {
+      // update centipedes and collisions
+      if (!gameOver && !gameWon)
+      {
+          for (const c of centipedes)
+              c.update(timeDelta);
+          rebuildSegmentLookup();
+
+          // player collision with segments
+          for (const c of centipedes)
+          {
+              for (const s of c.segments)
+              {
+                  if (isOverlapping(player.pos, player.size, s.pos, s.size))
+                  {
+                      playerDie();
+                      break;
+                  }
+              }
+          }
+      }
+
+      // next level after a win
+      if (gameWon)
+      {
+          // small delay so it feels like a beat
+          if (!gameWon._t) gameWon._t = 0;
+          gameWon._t += timeDelta;
+          if (gameWon._t > .6)
+          {
+              gameWon._t = 0;
+              gameWon = false;
+              spawnLevel();
+          }
+      }
+  }
+
+  function gameUpdatePost()
+  {
+      // keep camera steady
+      setCameraPos(levelSize.scale(.5));
+  }
+
+  function gameRender()
+  {
+      // background
+      drawRect(cameraPos, vec2(200), rgb(.05,.06,.08));
+
+      // playfield boundary
+      drawRect(cameraPos, levelSize.add(vec2(.2)), rgb(0,0,0,.9));
+      drawRect(cameraPos, levelSize, rgb(.08,.09,.11));
+
+      // subtle grid
+      for (let x=0; x<=gridSize.x; ++x)
+          drawLine(vec2(x,0), vec2(x,gridSize.y), .03, rgb(0,0,0,.22));
+      for (let y=0; y<=gridSize.y; ++y)
+          drawLine(vec2(0,y), vec2(gridSize.x,y), .03, rgb(0,0,0,.22));
+
+      // player zone line
+      drawLine(vec2(0, playerMaxY+1), vec2(gridSize.x, playerMaxY+1), .06, rgb(1,1,1,.08));
+  }
+
+  function gameRenderPost()
+  {
+      // HUD
+      const left = 18;
+      const top = 16;
+      drawTextScreen(`Score ${score}`, vec2(left, top), 22, rgb(1,1,1), 4, rgb(0,0,0), 'left');
+      drawTextScreen(`Lives ${lives}`, vec2(left, top+26), 22, rgb(1,1,1), 4, rgb(0,0,0), 'left');
+      drawTextScreen(`Level ${level}`, vec2(left, top+52), 22, rgb(1,1,1), 4, rgb(0,0,0), 'left');
+
+      // instructions
+      const help = 'Move: Mouse or WASD/Arrows  •  Shoot: Hold Space/Click  •  Restart: Enter';
+      drawTextScreen(help, vec2(mainCanvasSize.x/2, mainCanvasSize.y-18), 18, rgb(1,1,1,.9), 4, rgb(0,0,0,.7));
+
+      if (gameOver)
+          drawTextScreen('GAME OVER\nPress Enter / Space / Click', vec2(mainCanvasSize.x/2, mainCanvasSize.y/2), 52, rgb(1,.35,.35), 8, rgb(0,0,0));
+      else if (gameWon)
+          drawTextScreen('CLEARED!  Next wave…', vec2(mainCanvasSize.x/2, mainCanvasSize.y/2), 52, rgb(.35,1,.55), 8, rgb(0,0,0));
+  }
+
+  // Startup
+  engineInit(gameInit, gameUpdate, gameUpdatePost, gameRender, gameRenderPost);
+
+  </script>
+</body>
+</html>

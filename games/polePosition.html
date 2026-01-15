@@ -1,0 +1,677 @@
+<!DOCTYPE html><head>
+<title>LittleJS AI Starter Project</title>
+<meta charset=utf-8>
+</head><body>
+<script src="https://cdn.jsdelivr.net/npm/littlejsengine@1.17.11/dist/littlejs.js"></script>
+<script>
+'use strict';
+
+// engine settings
+debugWatermark = false; // Hide debug watermark in corner
+showEngineVersion = false; // Hide engine version console display
+
+glEnable = false; // we render with Canvas2D primitives only
+
+// AI can use this class to make sound effects
+class SoundGenerator extends Sound 
+{
+    constructor(params = {})
+    {
+        const {
+            volume = 1,        // Volume scale (percent)
+            randomness = .05,  // How much to randomize frequency (percent Hz)
+            frequency = 220,   // Frequency of sound (Hz)
+            attack = 0,        // Attack time, how fast sound starts (seconds)
+            release = .1,      // Release time, how fast sound fades out (seconds)
+            shapeCurve = 1,    // Squarenes of wave (0=square, 1=normal, 2=pointy)
+            slide = 0,         // How much to slide frequency (kHz/s)
+            pitchJump = 0,     // Frequency of pitch jump (Hz)
+            pitchJumpTime = 0, // Time of pitch jump (seconds)
+            repeatTime = 0,    // Resets some parameters periodically (seconds)
+            noise = 0,         // How much random noise to add (percent)
+            bitCrush = 0,      // Resamples at a lower frequency in (samples*100)
+            delay = 0,         // Overlap sound with itself for reverb and flanger effects (seconds)
+        } = params;
+        
+        super([volume, randomness, frequency, attack, 0, release, 0, shapeCurve, slide, 0, pitchJump, pitchJumpTime, repeatTime, noise, 0, bitCrush, delay, 1, 0, 0, 0]);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Pole Position (tiny playable prototype)
+
+// track + camera constants (tuned for a ~960x540 canvas)
+const CANVAS_SIZE     = vec2(960, 540);
+const DRAW_DIST       = 260;   // how many road segments to draw
+const ROAD_W          = 1.85;  // road half-width in world units
+const CAMERA_HEIGHT   = 0.72;  // bigger = road appears lower
+const CAMERA_DEPTH    = 1.00;  // perspective strength
+const RUMBLE_W        = 1.22;  // rumble extends beyond road
+
+const MAX_SPEED       = 0.90;  // world segments per frame
+const ACCEL           = 0.012;
+const BRAKE           = 0.020;
+const COAST_DECEL     = 0.008;
+const OFFROAD_DECEL   = 0.030;
+
+// track data
+let segments = [];
+let trackLen = 0;
+
+// game state
+let state = 'title'; // 'title' | 'play' | 'timeup'
+let trackPos = 0;    // distance along track in segments
+let speed = 0;
+let playerX = 0;     // lateral offset in world units
+let score = 0;
+let lap = 0;
+let timeLeftFrames = 60 * 60; // 60 seconds at 60 fps
+let crashTimer = 0;
+
+// AI cars
+let aiCars = [];
+
+// cached projection for the visible road
+let proj = [];
+
+// sounds
+let sStart, sCrash, sRumble;
+
+///////////////////////////////////////////////////////////////////////////////
+function buildTrack()
+{
+    segments = [];
+
+    const add = (count, curve=0)=>
+    {
+        for (let i=0; i<count; ++i)
+            segments.push({ curve });
+    };
+
+    // A simple repeating circuit: straights + wide left/right + S bends
+    add(160, 0);
+    add(120, -0.0020);
+    add(60,  -0.0010);
+    add(120, 0);
+    add(140, 0.0022);
+    add(80,  0.0012);
+    add(130, 0);
+
+    // S bend section
+    add(60,  -0.0024);
+    add(60,   0.0024);
+    add(60,  -0.0016);
+    add(60,   0.0016);
+
+    // long straight to feel fast
+    add(220, 0);
+
+    // big sweeping right back to start
+    add(180, 0.0020);
+    add(80,  0.0010);
+    add(120, 0);
+
+    // pad a bit for comfort
+    add(60, 0);
+
+    trackLen = segments.length;
+}
+
+function resetGame()
+{
+    state = 'play';
+    trackPos = 0;
+    speed = 0;
+    playerX = 0;
+    score = 0;
+    lap = 0;
+    timeLeftFrames = 60 * 60;
+    crashTimer = 0;
+
+    // spawn some simple AI cars ahead
+    aiCars = [];
+    const carCount = 12;
+    for (let i=0; i<carCount; ++i)
+    {
+        aiCars.push({
+            z: (i*trackLen/carCount + 60) % trackLen,
+            speed: rand(0.35, 0.55),
+            offset: rand(0.9, -0.9),
+            wobble: rand(1000),
+            colorH: rand(),
+        });
+    }
+
+    sStart && sStart.play();
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameInit()
+{
+    setCanvasFixedSize(CANVAS_SIZE);
+    buildTrack();
+
+    // lightweight sfx
+    sStart  = new SoundGenerator({ volume:.6, frequency:420, attack:0, release:.08, pitchJump:80, pitchJumpTime:.02, noise:.02 });
+    sCrash  = new SoundGenerator({ volume:.8, frequency:90,  attack:0, release:.25, shapeCurve:0, noise:.35, bitCrush:6, slide:-.6 });
+    sRumble = new SoundGenerator({ volume:.25, frequency:120, attack:0, release:.05, noise:.15, bitCrush:10 });
+
+    proj = new Array(DRAW_DIST+2);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameUpdate()
+{
+    // title / restart
+    const startPressed = keyWasPressed('Enter') || keyWasPressed('Space');
+    if (state !== 'play')
+    {
+        if (startPressed)
+            resetGame();
+        return;
+    }
+
+    // input
+    const up    = keyIsDown('ArrowUp')   || keyIsDown('KeyW');
+    const down  = keyIsDown('ArrowDown') || keyIsDown('KeyS');
+    const left  = keyIsDown('ArrowLeft') || keyIsDown('KeyA');
+    const right = keyIsDown('ArrowRight')|| keyIsDown('KeyD');
+
+    // speed
+    if (up)   speed += ACCEL;
+    else     speed -= COAST_DECEL;
+    if (down) speed -= BRAKE;
+    speed = clamp(speed, 0, MAX_SPEED);
+
+    // steering (more responsive at speed)
+    const steer = (right?1:0) - (left?1:0);
+    const steerStrength = 0.06 + speed*0.20;
+    playerX += steer * steerStrength;
+
+    // centrifugal force from current curve
+    const baseIndex = trackPos|0;
+    const curve = segments[baseIndex % trackLen].curve;
+    playerX -= curve * speed * 45; // reduced centrifugal pull
+
+    // crash recovery
+    if (crashTimer > 0)
+        crashTimer--;
+
+    // offroad
+    const offRoad = abs(playerX) > ROAD_W*1.02;
+    if (offRoad)
+    {
+        speed = max(0, speed - OFFROAD_DECEL);
+        if (speed > .15 && (frame & 7) === 0)
+            sRumble.play();
+    }
+
+    // advance along track
+    const lastPos = trackPos;
+    trackPos += speed;
+    if (trackPos >= trackLen)
+    {
+        trackPos -= trackLen;
+        lap++;
+    }
+
+    // score + timer
+    score += speed * 120 * (offRoad ? .6 : 1);
+    if (speed > .05)
+        timeLeftFrames--;
+
+    if (timeLeftFrames <= 0)
+    {
+        state = 'timeup';
+        speed = 0;
+        return;
+    }
+
+    // AI cars
+    for (const c of aiCars)
+    {
+        // slight lane wobble
+        c.wobble += 1;
+        c.offset += Math.sin(c.wobble*.02) * 0.0012;
+        c.offset = clamp(c.offset, -1.1, 1.1);
+
+        c.z += c.speed;
+        if (c.z >= trackLen)
+            c.z -= trackLen;
+
+        // collision when very close in Z
+        const dz = (c.z - trackPos + trackLen) % trackLen;
+        if (dz < 1.2 && dz > 0)
+        {
+            if (abs(playerX - c.offset) < .22 && crashTimer <= 0 && speed > .10)
+            {
+                crashTimer = 35;
+                speed *= .55;
+                playerX += sign(playerX - c.offset || randSign()) * .28;
+                sCrash.play();
+            }
+        }
+
+        // keep AI from lingering right on player forever
+        if (dz < .25)
+            c.z = (c.z + 12) % trackLen;
+    }
+
+    // mild recentering at low speed
+    playerX = lerp(playerX, 0, speed < .15 ? .02 : 0);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameUpdatePost()
+{
+    // no world-space camera needed, we render in screen space
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function projectPoint(z, x, w, h, horizonY)
+{
+    const scale = CAMERA_DEPTH / z;
+    const screenX = w/2 + scale * (x - playerX) * w/2;
+    const screenY = horizonY + scale * CAMERA_HEIGHT * h;
+    const roadW = scale * ROAD_W * w/2;
+    const rumbleW = roadW * RUMBLE_W;
+
+    return { screenX, screenY, scale, roadW, rumbleW };
+}
+
+function fillQuad(ctx, x1,y1, x2,y2, x3,y3, x4,y4)
+{
+    ctx.beginPath();
+    ctx.moveTo(x1,y1);
+    ctx.lineTo(x2,y2);
+    ctx.lineTo(x3,y3);
+    ctx.lineTo(x4,y4);
+    ctx.closePath();
+    ctx.fill();
+}
+
+// deterministic tiny hash for scenery variation
+const frac = (x)=> x - Math.floor(x);
+const hash01 = (n)=> frac(Math.sin(n*127.1) * 43758.5453123);
+
+function drawTree(ctx, x, yGround, size, seed)
+{
+    // size in pixels
+    const trunkH = size * 0.34;
+    const trunkW = size * 0.13;
+    const canopyR = size * 0.32;
+
+    const hJit = (hash01(seed+9) - .5) * size * 0.12;
+    const hue = .30 + (hash01(seed+2)-.5) * .06;
+
+    // trunk
+    ctx.fillStyle = hsl(.08, .45, .28).toString();
+    ctx.fillRect(x - trunkW/2, yGround - trunkH + hJit, trunkW, trunkH);
+
+    // canopy (3 blobs)
+    ctx.fillStyle = hsl(hue, .70, .30).toString();
+    ctx.beginPath();
+    const cY = yGround - trunkH + hJit;
+    const r1 = canopyR * (0.85 + hash01(seed+3)*0.25);
+    const r2 = canopyR * (0.75 + hash01(seed+4)*0.30);
+    const r3 = canopyR * (0.70 + hash01(seed+5)*0.35);
+    ctx.arc(x,                 cY - canopyR*0.55, r1, 0, Math.PI*2);
+    ctx.arc(x - canopyR*0.55,  cY - canopyR*0.20, r2, 0, Math.PI*2);
+    ctx.arc(x + canopyR*0.55,  cY - canopyR*0.15, r3, 0, Math.PI*2);
+    ctx.fill();
+}
+
+function drawSign(ctx, x, yGround, size, seed)
+{
+    const postH = size * 0.60;
+    const postW = max(2, size * 0.07);
+    const boardW = size * (0.55 + hash01(seed+1)*0.25);
+    const boardH = size * 0.22;
+
+    // post
+    ctx.fillStyle = hsl(0, 0, .25).toString();
+    ctx.fillRect(x - postW/2, yGround - postH, postW, postH);
+
+    // sign board
+    const hue = hash01(seed+7);
+    ctx.fillStyle = hsl(hue, .75, .55).toString();
+    ctx.fillRect(x - boardW/2, yGround - postH - boardH*0.85, boardW, boardH);
+
+    // stripe detail
+    ctx.fillStyle = hsl(0,0,1,.85).toString();
+    ctx.fillRect(x - boardW*0.42, yGround - postH - boardH*0.62, boardW*0.84, max(2, boardH*0.18));
+}
+
+function renderRoadAndCars()
+{
+    const ctx = mainContext;
+    const w = mainCanvasSize.x;
+    const h = mainCanvasSize.y;
+    const horizonY = h * 0.36;
+
+    // sky
+    ctx.fillStyle = hsl(.58, .55, .75).toString();
+    ctx.fillRect(0, 0, w, horizonY);
+
+    // distant haze
+    ctx.fillStyle = hsl(.58, .25, .85, .25).toString();
+    ctx.fillRect(0, horizonY-18, w, 36);
+
+    // precompute visible road
+    const baseIndex = trackPos|0;
+    const offset = trackPos - baseIndex;
+
+    let x = 0;
+    let dx = 0;
+    for (let i=0; i<=DRAW_DIST+1; ++i)
+    {
+        const seg = segments[(baseIndex + i) % trackLen];
+        x += dx;
+        dx += seg.curve;
+
+        const z = max(1.2, i + 1 - offset); // clamp near plane to prevent distortion but keep road visible
+        const p = projectPoint(z, x, w, h, horizonY);
+        p.i = i;
+        p.curve = seg.curve;
+        p.grassAlt = (((baseIndex + i) / 6)|0) & 1;
+        p.rumbleAlt = (((baseIndex + i) / 3)|0) & 1;
+        proj[i] = p;
+    }
+
+    // grass base under horizon
+    ctx.fillStyle = hsl(.33, .85, .25).toString();
+    ctx.fillRect(0, horizonY, w, h-horizonY);
+
+    // dash pattern settings (in world segments)
+    const dashPeriod = 8;
+    const dashOn = 4;
+    const dashIsOn = (worldPos)=> ((worldPos % dashPeriod + dashPeriod) % dashPeriod) < dashOn;
+
+    // draw from far -> near
+    let prev = proj[DRAW_DIST];
+    for (let i=DRAW_DIST-1; i>=0; --i)
+    {
+        const cur = proj[i];
+        // snap to integer scanlines to avoid cracks between segments
+        let yFar = clamp(prev.screenY, 0, h);
+        let yNear = clamp(cur.screenY, 0, h);
+        yFar = clamp(Math.floor(yFar), 0, h);
+        yNear = clamp(Math.ceil(yNear) + 1, 0, h); // +1px overlap prevents hairline gaps
+        if (yNear <= yFar)
+        {
+            prev = cur;
+            continue;
+        }
+
+        // grass stripes
+        ctx.fillStyle = (cur.grassAlt ? hsl(.33,.85,.22) : hsl(.33,.80,.28)).toString();
+        ctx.fillRect(0, yFar, w, yNear - yFar);
+
+        // rumble strips
+        const farL = prev.screenX - prev.rumbleW;
+        const farR = prev.screenX + prev.rumbleW;
+        const nearL = cur.screenX - cur.rumbleW;
+        const nearR = cur.screenX + cur.rumbleW;
+
+        ctx.fillStyle = (cur.rumbleAlt ? hsl(0,0,1) : hsl(0,1,.45)).toString();
+        fillQuad(ctx, nearL, yNear, farL, yFar, farR, yFar, nearR, yNear);
+
+        // road
+        const farRL = prev.screenX - prev.roadW;
+        const farRR = prev.screenX + prev.roadW;
+        const nearRL = cur.screenX - cur.roadW;
+        const nearRR = cur.screenX + cur.roadW;
+
+        ctx.fillStyle = (cur.rumbleAlt ? hsl(0,0,.23) : hsl(0,0,.18)).toString();
+        fillQuad(ctx, nearRL, yNear, farRL, yFar, farRR, yFar, nearRR, yNear);
+
+        // center line (dashed, locked to world so it scrolls correctly)
+        const worldPos = baseIndex + i + offset;
+        if (dashIsOn(worldPos))
+        {
+            const farC = prev.screenX;
+            const nearC = cur.screenX;
+            const lineWFar = max(1, prev.roadW * .03);
+            const lineWNear = max(1, cur.roadW * .03);
+            ctx.fillStyle = hsl(0,0,.92,.9).toString();
+            fillQuad(ctx,
+                nearC-lineWNear, yNear, farC-lineWFar, yFar,
+                farC+lineWFar, yFar, nearC+lineWNear, yNear);
+        }
+
+        // roadside scenery (trees + signs)
+        // draw in the same far->near order so near scenery occludes far scenery
+        if (cur.scale > 0.003 && yNear > horizonY + 6)
+        {
+            const segIndex = (baseIndex + i) % trackLen;
+            const baseSize = clamp(cur.scale * h * 1.15, 14, 230);
+
+            // trees every ~7-11 segments
+            if ((segIndex % 7) === 0)
+            {
+                const xTreeL = cur.screenX - (cur.rumbleW + cur.roadW*0.85);
+                drawTree(ctx, xTreeL, yNear, baseSize, segIndex*3 + 1);
+            }
+            if ((segIndex % 11) === 0)
+            {
+                const xTreeR = cur.screenX + (cur.rumbleW + cur.roadW*0.85);
+                drawTree(ctx, xTreeR, yNear, baseSize, segIndex*3 + 2);
+            }
+
+            // signs every ~13 segments (alternate sides)
+            if ((segIndex % 13) === 0)
+            {
+                const side = (segIndex & 1) ? -1 : 1;
+                const xSign = cur.screenX + side * (cur.rumbleW + cur.roadW*0.55);
+                drawSign(ctx, xSign, yNear, baseSize*0.85, segIndex*5 + 7);
+            }
+        }
+
+        prev = cur;
+    }
+
+    // ensure the road reaches the bottom of the screen (near cap)
+    {
+        const p = proj[0];
+        if (p)
+        {
+            const yTop = clamp(Math.floor(p.screenY), 0, h);
+            if (yTop < h)
+            {
+                const yBottom = h + 2; // a tiny overshoot to avoid bottom edge gaps
+                const bottomScale = 1.18;
+
+                // rumble
+                const topL = p.screenX - p.rumbleW;
+                const topR = p.screenX + p.rumbleW;
+                const botL = p.screenX - p.rumbleW * bottomScale;
+                const botR = p.screenX + p.rumbleW * bottomScale;
+                ctx.fillStyle = (p.rumbleAlt ? hsl(0,0,1) : hsl(0,1,.45)).toString();
+                fillQuad(ctx, botL, yBottom, topL, yTop, topR, yTop, botR, yBottom);
+
+                // road
+                const topRL = p.screenX - p.roadW;
+                const topRR = p.screenX + p.roadW;
+                const botRL = p.screenX - p.roadW * bottomScale;
+                const botRR = p.screenX + p.roadW * bottomScale;
+                ctx.fillStyle = (p.rumbleAlt ? hsl(0,0,.23) : hsl(0,0,.18)).toString();
+                fillQuad(ctx, botRL, yBottom, topRL, yTop, topRR, yTop, botRR, yBottom);
+
+                // center stripe (match dash pattern)
+                const capWorldPos = baseIndex + offset;
+                if (dashIsOn(capWorldPos))
+                {
+                    ctx.fillStyle = hsl(0,0,.92,.9).toString();
+                    const lineWTop = max(1, p.roadW * .03);
+                    const lineWBot = max(1, p.roadW * .03 * bottomScale);
+                    fillQuad(ctx,
+                        p.screenX-lineWBot, yBottom, p.screenX-lineWTop, yTop,
+                        p.screenX+lineWTop, yTop, p.screenX+lineWBot, yBottom);
+                }
+            }
+        }
+    }
+
+    // draw AI cars from far -> near (using the projection table)
+    const visibleCars = [];
+    for (const c of aiCars)
+    {
+        const dz = (c.z - trackPos + trackLen) % trackLen;
+        if (dz <= 0 || dz >= DRAW_DIST) continue;
+        visibleCars.push({ c, dz });
+    }
+    visibleCars.sort((a,b)=> b.dz - a.dz); // far first
+
+    for (const {c, dz} of visibleCars)
+    {
+        const i = dz|0;
+        const t = dz - i;
+        const a = proj[i];
+        const b = proj[i+1];
+        if (!a || !b) continue;
+
+        const lerpP = (k)=> lerp(a[k], b[k], t);
+        const sx = lerpP('screenX');
+        const sy = lerpP('screenY');
+        const sc = lerpP('scale');
+        const roadW = lerpP('roadW');
+
+        const carX = sx + sc * c.offset * w/2;
+        const carW = max(6, sc * 0.24 * w/2);
+        const carH = max(8, sc * 0.36 * h);
+        const carY = sy - carH;
+
+        // simple occlusion: don't draw if behind horizon
+        if (carY < h*0.08 || carY > h) continue;
+
+        const body = hsl(c.colorH, .75, .55).toString();
+        ctx.fillStyle = body;
+        ctx.fillRect(carX - carW/2, carY, carW, carH);
+
+        // windshield stripe
+        ctx.fillStyle = hsl(.55, .35, .75, .85).toString();
+        ctx.fillRect(carX - carW*0.30, carY + carH*0.18, carW*0.60, carH*0.18);
+
+        // wheels
+        ctx.fillStyle = hsl(0,0,.08).toString();
+        const ww = carW*0.18;
+        const wh = carH*0.25;
+        ctx.fillRect(carX - carW/2 - ww*0.2, carY + carH*0.72, ww, wh);
+        ctx.fillRect(carX + carW/2 - ww*0.8, carY + carH*0.72, ww, wh);
+    }
+
+    // player car (screen-fixed, like arcade view)
+    const carScreenY = h * 0.86;
+    const carScreenX = w * 0.5 + (keyIsDown('ArrowLeft')||keyIsDown('KeyA') ? -6 : 0) + (keyIsDown('ArrowRight')||keyIsDown('KeyD') ? 6 : 0);
+    const carScale = 1;
+    drawPlayerCar(ctx, carScreenX, carScreenY, carScale);
+
+    // subtle vignette
+    ctx.fillStyle = hsl(0,0,0,.18).toString();
+    ctx.fillRect(0, 0, w, 12);
+    ctx.fillRect(0, h-12, w, 12);
+}
+
+function drawPlayerCar(ctx, x, y, s=1)
+{
+    const w = 92*s;
+    const h = 60*s;
+
+    // shadow
+    ctx.fillStyle = hsl(0,0,0,.35).toString();
+    ctx.fillRect(x - w*0.46, y + h*0.18, w*0.92, h*0.22);
+
+    // body
+    ctx.fillStyle = (crashTimer>0 && (frame&3)<2) ? hsl(0,0,1).toString() : hsl(.02, .9, .52).toString();
+    ctx.fillRect(x - w/2, y - h, w, h);
+
+    // cockpit
+    ctx.fillStyle = hsl(.58, .40, .75, .9).toString();
+    ctx.fillRect(x - w*0.18, y - h*0.70, w*0.36, h*0.26);
+
+    // nose stripe
+    ctx.fillStyle = hsl(0,0,1,.85).toString();
+    ctx.fillRect(x - w*0.06, y - h, w*0.12, h);
+
+    // wheels
+    ctx.fillStyle = hsl(0,0,.08).toString();
+    const ww = w*0.16;
+    const wh = h*0.30;
+    ctx.fillRect(x - w/2 - ww*0.15, y - h*0.35, ww, wh);
+    ctx.fillRect(x + w/2 - ww*0.85, y - h*0.35, ww, wh);
+    ctx.fillRect(x - w/2 - ww*0.15, y - h*0.92, ww, wh);
+    ctx.fillRect(x + w/2 - ww*0.85, y - h*0.92, ww, wh);
+
+    // small rear wing
+    ctx.fillStyle = hsl(.02, .9, .35).toString();
+    ctx.fillRect(x - w*0.60, y - h*0.92, w*1.20, h*0.10);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameRender()
+{
+    // clear (engine might already clear, but this is explicit)
+    mainContext.clearRect(0, 0, mainCanvasSize.x, mainCanvasSize.y);
+
+    if (state === 'play')
+        renderRoadAndCars();
+    else
+    {
+        // background for title/timeup
+        const ctx = mainContext;
+        const w = mainCanvasSize.x;
+        const h = mainCanvasSize.y;
+        ctx.fillStyle = hsl(.58, .55, .75).toString();
+        ctx.fillRect(0, 0, w, h);
+        ctx.fillStyle = hsl(.33, .85, .25).toString();
+        ctx.fillRect(0, h*0.55, w, h*0.45);
+
+        // tiny fake road
+        ctx.fillStyle = hsl(0,0,.2).toString();
+        fillQuad(ctx, w*.40, h, w*.46, h*.58, w*.54, h*.58, w*.60, h);
+
+        // parked car
+        drawPlayerCar(ctx, w*0.5, h*0.82, 1);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameRenderPost()
+{
+    const w = mainCanvasSize.x;
+    const h = mainCanvasSize.y;
+
+    if (state === 'play')
+    {
+        const mph = (speed / MAX_SPEED * 230) | 0;
+        const t = max(0, timeLeftFrames) / 60;
+
+        drawTextScreen(`SPEED  ${mph} mph`, vec2(14, 18), 28, hsl(0,0,1), 4, hsl(0,0,0), 'left', 'monospace');
+        drawTextScreen(`TIME   ${formatTime(t)}`, vec2(14, 48), 28, hsl(0,0,1), 4, hsl(0,0,0), 'left', 'monospace');
+        drawTextScreen(`LAP    ${lap}`, vec2(14, 78), 28, hsl(0,0,1), 4, hsl(0,0,0), 'left', 'monospace');
+        drawTextScreen(`SCORE  ${score|0}`, vec2(w-14, 18), 28, hsl(0,0,1), 4, hsl(0,0,0), 'right', 'monospace');
+
+        // small hints
+        drawTextScreen('ARROWS/WASD  = drive', vec2(w-14, h-52), 20, hsl(0,0,1,.85), 3, hsl(0,0,0,.8), 'right', 'monospace');
+        drawTextScreen('Stay on the asphalt!', vec2(w-14, h-28), 20, hsl(0,0,1,.85), 3, hsl(0,0,0,.8), 'right', 'monospace');
+    }
+    else if (state === 'title')
+    {
+        drawTextScreen('POLE POSITION (tiny)', vec2(w/2, h*0.20), 70, hsl(.02,.9,.55), 8, hsl(0,0,0), 'center', 'monospace');
+        drawTextScreen('PRESS ENTER / SPACE', vec2(w/2, h*0.30), 34, hsl(0,0,1), 6, hsl(0,0,0), 'center', 'monospace');
+        drawTextScreen('ARROWS/WASD TO DRIVE', vec2(w/2, h*0.36), 24, hsl(0,0,1,.9), 4, hsl(0,0,0,.85), 'center', 'monospace');
+        drawTextScreen('PASS CARS • DON\'T GO OFFROAD', vec2(w/2, h*0.40), 22, hsl(0,0,1,.9), 4, hsl(0,0,0,.85), 'center', 'monospace');
+    }
+    else if (state === 'timeup')
+    {
+        drawTextScreen('TIME UP!', vec2(w/2, h*0.22), 84, hsl(0,0,1), 10, hsl(0,0,0), 'center', 'monospace');
+        drawTextScreen(`FINAL SCORE  ${score|0}`, vec2(w/2, h*0.34), 38, hsl(.02,.9,.55), 6, hsl(0,0,0), 'center', 'monospace');
+        drawTextScreen('PRESS ENTER / SPACE TO TRY AGAIN', vec2(w/2, h*0.42), 26, hsl(0,0,1,.9), 5, hsl(0,0,0,.85), 'center', 'monospace');
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Startup LittleJS Engine
+engineInit(gameInit, gameUpdate, gameUpdatePost, gameRender, gameRenderPost);
+
+</script>
