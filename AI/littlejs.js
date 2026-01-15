@@ -35,7 +35,7 @@ const engineName = 'LittleJS';
  *  @type {string}
  *  @default
  *  @memberof Engine */
-const engineVersion = '1.17.11';
+const engineVersion = '1.17.15';
 
 /** Frames per second to update
  *  @type {number}
@@ -609,7 +609,7 @@ function drawEngineLogo(t)
     const color = (c,l)=> l?`hsl(${[.95,.56,.13][c%3]*360} 99%${[0,50,75][l]}%`:'#000';
 
     // center and fit tos screen
-    const alpha = wave(1,1,t);
+    const alpha = oscillate(1,1,t);
     const p = percent(alpha, .1, .5);
     const size = min(6, min(w,h)/99);
     x.translate(w/2,h/2);
@@ -1668,10 +1668,24 @@ function isIntersecting(start, end, pos, size)
  *  @param {number} [amplitude] - Amplitude (max height) of the wave
  *  @param {number} [t=time]    - Value to use for time of the wave
  *  @param {number} [offset]    - Value to use for time offset of the wave
+ *  @param {number} [type]      - Wave type: 0=sine, 1=triangle, 2=square, 3=sawtooth
  *  @return {number}            - Value waving between 0 and amplitude
  *  @memberof Math */
-function wave(frequency=1, amplitude=1, t=time, offset=0)
-{ return amplitude/2 * (1 - cos(offset + t*frequency*2*PI)); }
+function oscillate(frequency=1, amplitude=1, t=time, offset=0, type=0)
+{
+    const phase = (offset + t*frequency) % 1;
+    let value;
+    
+    if (type === 1) // triangle
+        value = 2 * abs(2 * phase - 1) - 1;
+    else if (type === 2) // square
+        value = phase < .5 ? -1 : 1;
+    else if (type === 3) // sawtooth
+        value = 2 * phase - 1;
+    else // sine
+        value = -cos(phase * 2*PI);
+    return amplitude/2 * (value + 1);
+}
 
 /**
  * Check if object is a valid number, not NaN or undefined, but it may be infinite
@@ -1753,15 +1767,17 @@ function lineTest(posStart, posEnd, testFunction, normal)
             // set hit point
             const hitPos = vec2(posStart.x + dirX*t, posStart.y + dirY*t);
 
-            // move inside of tile if on positive edge
+            // ensure result is inside the tile
             const e = 1e-9;
-            if (wasX)
-            {
-                if (stepX < 0)
-                    hitPos.x -= e;
-            }
-            else if (stepY < 0)
-                hitPos.y -= e;
+            const hitPosFloor = hitPos.floor();
+            if (hitPosFloor.x < pos.x)
+                hitPos.x = pos.x;
+            else if (hitPosFloor.x > pos.x)
+                hitPos.x = pos.x + 1 - e;
+            if (hitPosFloor.y < pos.y)
+                hitPos.y = pos.y;
+            else if (hitPosFloor.y > pos.y) 
+                hitPos.y = pos.y + 1 - e;
 
             // set normal
             if (normal)
@@ -3854,13 +3870,17 @@ class EngineObject
     {
         if (!debug) return;
 
+        // check if there is anything to show
+        const hasPhysics = this.collideTiles || this.collideSolidObjects || this.isSolid;
+        if (!hasPhysics && !this.parent) return;
+
         // show object info for debugging
         const size = vec2(max(this.size.x, .2), max(this.size.y, .2));
         const color = rgb(this.collideTiles?1:0, this.collideSolidObjects?1:0, this.isSolid?1:0, .5);
-        drawRect(this.pos, size, color, this.angle);
+        debugRect(this.pos, size, color, 0, this.angle, hasPhysics);
         if (this.parent)
-            drawRect(this.pos, size.scale(.8), rgb(1,1,1,.5), this.angle);
-        this.parent && drawLine(this.pos, this.parent.pos, .1, rgb(1,1,1,.5));
+            debugRect(this.pos, size.scale(.8), rgb(1,1,1,.5), 0, this.angle);
+        this.parent && debugLine(this.pos, this.parent.pos, rgb(1,1,1,.5), .5);
     }
 }
 /**
@@ -3972,6 +3992,7 @@ function tile(index=new Vector2, size=tileDefaultSize, texture=0, padding=tileDe
     // create tile info object
     const textureInfo = typeof texture === 'number' ?
         textureInfos[texture] : texture;
+    ASSERT(textureInfo instanceof TextureInfo, 'tile texture is not loaded');
 
     // get the position of the tile
     const sizePaddedX = size.x + padding*2;
@@ -5352,7 +5373,19 @@ function inputInit()
                 inputData[0][remapKey(e.code)] = 3;
         }
 
-        // prevent arrow key from moving the page
+        // try to prevent default browser handling of input
+        if (!inputPreventDefault || !document.hasFocus() || !e.cancelable) return;
+
+        // don't break browser shortcuts
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+        // don't interfere with user typing into UI fields
+        if (isTextInput(e.target) || isTextInput(document.activeElement)) return;
+
+        // fix browser setting "Search for text when you start typing"
+        const printable = typeof e.key === 'string' && e.key.length === 1;
+
+        // prevent arrow key and other default keys from messing with stuff
         const preventDefaultKeys = 
         [
             'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', // scrolling
@@ -5360,9 +5393,15 @@ function inputInit()
             'Tab',          // focus navigation
             'Backspace',    // browser back
         ];
-        if (preventDefaultKeys.includes(e.code))
-        if (inputPreventDefault && document.hasFocus() && e.cancelable)
+        if (preventDefaultKeys.includes(e.code) || printable)
             e.preventDefault();
+                    
+        function isTextInput(element)
+        {
+            const tag = element?.tagName;
+            const editable = element?.isContentEditable;
+            return editable || ['INPUT','TEXTAREA','SELECT'].includes(tag);
+        }
     }
     function onKeyUp(e)
     {
@@ -9405,8 +9444,15 @@ class UISystemPlugin
         this.lastHoverObject = undefined;
         /** @property {UIObject} - Current confirm menu being shown */
         this.confirmDialog = undefined;
+        /** @property {UIObject} - Object to send keyboard input to */
+        this.keyInputObject = undefined;
 
         engineAddPlugin(uiUpdate, uiRender);
+
+        // key down handler
+        function onKeyDown(e)
+        { uiSystem.keyInputObject?.onKeyDown(e); }
+        document.addEventListener('keydown', onKeyDown);
 
         // set object position in parent space
         function updateTransforms(o)
@@ -9426,9 +9472,18 @@ class UISystemPlugin
             // reset hover object at start of update
             uiSystem.lastHoverObject = uiSystem.hoverObject;
             uiSystem.hoverObject = undefined;
-
+            
             if (mouseWasPressed(0))
             {
+                // exit navigation mode on mouse press
+                uiSystem.navigationMode = false;
+                uiSystem.navigationObject = undefined;
+            }
+            if (uiSystem.keyInputObject)
+            {
+                // handle text input
+                uiSystem.activeObject = uiSystem.keyInputObject;
+                uiSystem.hoverObject = uiSystem.keyInputObject;
                 uiSystem.navigationMode = false;
                 uiSystem.navigationObject = undefined;
             }
@@ -9437,7 +9492,7 @@ class UISystemPlugin
             const navigableObjects = uiSystem.getNavigableObjects();
             if (!navigableObjects.length)
                 uiSystem.navigationObject = undefined;
-            else
+            else if (!uiSystem.keyInputObject)
             {
                 // unselect object if it is no longer navigable
                 if (!navigableObjects.includes(uiSystem.navigationObject))
@@ -9750,6 +9805,7 @@ class UISystemPlugin
         this.activeObject = undefined;
         this.hoverObject = undefined;
         this.lastHoverObject = undefined;
+        this.keyInputObject = undefined;
     }
 
     /** Get all navigable UI objects sorted by navigationIndex
@@ -10030,7 +10086,7 @@ class UIObject
         }
     }
 
-    /** Check if the mouse is overlapping a box in screen space
+    /** Check if the mouse is overlapping this ui object
      *  @return {boolean} - True if overlapping */
     isMouseOverlapping()
     {
@@ -10049,8 +10105,16 @@ class UIObject
         this.onUpdate();
 
         // unset active if disabled
-        if (this.disabled && this === uiSystem.activeObject)
-            uiSystem.activeObject = undefined;
+        if (this.disabled)
+        {
+            if (this === uiSystem.activeObject)
+                uiSystem.activeObject = undefined;
+            if (this === uiSystem.keyInputObject)
+                uiSystem.keyInputObject = undefined;
+        }
+
+        if (uiSystem.keyInputObject)
+            return;
 
         const wasHover = uiSystem.lastHoverObject === this;
         const isActive = this.isActiveObject();
@@ -10077,19 +10141,12 @@ class UIObject
                         uiSystem.activeObject = this;
 
                         if (uiSystem.activateOnPress)
-                        {
-                            this.onClick();
-                            if (!this.soundPress && this.soundClick)
-                                this.soundClick.play();
-                        }
+                            this.click(!this.soundPress);
                     }
                 }
                 if (!uiSystem.activateOnPress)
                 if (!mouseDown && this.isActiveObject() && this.interactive)
-                {
-                    this.onClick();
-                    this.soundClick && this.soundClick.play();
-                }
+                    this.click();
             }
 
             // clear mouse was pressed state even when disabled
@@ -10141,11 +10198,7 @@ class UIObject
     }
 
     /** Called when the navigation button is pressed on this object */
-    navigatePressed()
-    {
-        this.onClick();
-        this.soundClick && this.soundClick.play();
-    }
+    navigatePressed() { this.click(); }
 
     /** @return {boolean} - Is the mouse hovering over this element */
     isHoverObject() { return uiSystem.hoverObject === this; }
@@ -10155,6 +10208,9 @@ class UIObject
 
     /** @return {boolean} - Is the gamepad or keyboard navigation object */
     isNavigationObject() { return uiSystem.navigationObject === this; }
+
+    /** @return {boolean} - Is this object in keyboard input mode */
+    isKeyInputObject() { return uiSystem.keyInputObject === this; }
 
     /** @return {boolean} - Can it be interacted with */
     isInteractive() { return this.interactive && this.visible && !this.disabled;}
@@ -10190,6 +10246,15 @@ class UIObject
             this.disabled ? PURPLE :
             this.interactive ? RED : BLUE;
         uiSystem.drawRect(this.pos, this.size, CLEAR_BLACK, 4, color);
+    }
+
+    /** Internal function called when object is clicked
+     *  @param {boolean} [playSound] */
+    click(playSound)
+    {
+        this.onClick(); 
+        if (playSound && this.soundClick)
+            this.soundClick.play();
     }
 
     /** Called each frame before object updates */
@@ -10264,6 +10329,102 @@ class UIText extends UIObject
         // render the text
         const textSize = this.getTextSize();
         uiSystem.drawText(this.text, this.pos, textSize, this.textColor, this.textLineWidth, this.textLineColor, this.align, this.font, this.fontStyle, true, this.textShadow, this.shadowColor, this.shadowBlur, this.shadowOffset);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+/** 
+ * UITextInput - An editable text input field
+ * - A simple text entry field that supports basic editing
+ * - Suitable for short text input like names or numbers
+ * @extends UIObject
+ * @memberof UISystem
+ */
+class UITextInput extends UIObject
+{
+    /** Create a UITextInput object
+     *  @param {Vector2} [pos]
+     *  @param {Vector2} [size]
+     *  @param {string}  [text]
+     */
+    constructor(pos, size, text='')
+    {
+        super(pos, size);
+
+        ASSERT(isString(text), 'ui text must be a string');
+
+        /** @property {number} - Max length of input (0 = no limit) */
+        this.maxLength = 0;
+
+        // set properties
+        this.text = text;
+        this.interactive = true;
+        this.canBeHover = true;
+    }
+
+    click()
+    {
+        // start editing the text
+        uiSystem.keyInputObject = this;
+        this.onClick();
+    }
+
+    /** Stop editing the text edited */
+    stopEditing()
+    {
+        if (!this.isKeyInputObject())
+            return;
+
+        if (this.soundRelease)
+            this.soundRelease.play();
+        uiSystem.activeObject = undefined;
+        uiSystem.keyInputObject = undefined;
+        this.onChange();
+    }
+
+    /** Key down event handler if this object is being edited
+     *  @param {KeyboardEvent} [e] */
+    onKeyDown(e)
+    {
+        const code = e.code, key = e.key
+        if (code === 'Backspace')
+            this.text = this.text.slice(0, -1);
+        else if (code === 'Enter' || code === 'Escape')
+            this.stopEditing();
+        else if (key.length === 1) // printable characters
+        {
+            if (!this.maxLength || this.text.length < this.maxLength)
+                this.text += key;
+        }
+    }
+
+    update()
+    {
+        super.update();
+
+        if (!this.isKeyInputObject())
+            return;
+
+        // click off object to stop editing
+        if (mouseWasPressed(0) && !this.isMouseOverlapping() ||
+            gamepadWasPressed(0, gamepadPrimary))
+        {
+            this.stopEditing();
+            inputClearKey(0,0);
+        }
+    }
+
+    render()
+    {
+        super.render();
+
+        // draw the text scaled to fit
+        const textSize = this.getTextSize();
+        let text = this.text;
+        if (this.isKeyInputObject()) // add a cursor to end of text
+            text += timeReal%1 < .5 ?  '█' : '░';
+        uiSystem.drawText(text, this.pos, textSize, 
+            this.textColor, this.textLineWidth, this.textLineColor, this.align, this.font, this.fontStyle, true, this.textShadow);
     }
 }
 
@@ -10378,9 +10539,10 @@ class UICheckbox extends UIObject
         this.color = color.copy();
         this.interactive = true;
     }
-    onClick()
+    click()
     {
         this.checked = !this.checked;
+        this.onClick();
         this.onChange();
     }
     render()
