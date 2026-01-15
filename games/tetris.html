@@ -1,467 +1,876 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>LittleJS Tetris</title>
-  <style>
-    html,body{margin:0;overflow:hidden;background:#000;}
-  </style>
-</head>
-<body>
-<script src="https://cdn.jsdelivr.net/npm/littlejsengine@1.17.11/dist/littlejs.min.js"></script>
+<!DOCTYPE html><head>
+<title>LittleJS AI Starter Project</title>
+<meta charset=utf-8>
+</head><body style="background:#000">
+<script src="https://cdn.jsdelivr.net/npm/littlejsengine@1.17.15/dist/littlejs.js"></script>
 <script>
 'use strict';
 
-// ------------------------------------------------------------
-// Tiny Tetris (one-file, no assets)
-// Controls:
-//   ←/→ move, ↓ soft drop, Space hard drop
-//   Z rotate CCW, X/↑ rotate CW
-//   C hold (once per drop)
-//   P pause, R restart
-// ------------------------------------------------------------
+// engine settings, do not remove
+debugWatermark = false; // Hide debug watermark in corner
+showEngineVersion = false; // Hide engine version console display
+paused = false; // Start unpaused
 
-// Board
-const W = 10, H = 20;
-let board;              // [H][W] = 0 or color index (1..7)
-let score = 0;
-let lines = 0;
-let level = 1;
-let gameOver = false;
-let pausedLocal = false;
+// engine settings, customize if necessary
+gravity = vec2(0, 0); // No gravity by default
+cameraPos = vec2(0, 0); // Camera centered at origin
+cameraScale = 32; // Camera zoom, larger is more zoomed in
 
-// Timers
-let fallTimer = 0;
-let lockTimer = 0;
-let moveRepeatL = 0, moveRepeatR = 0, softRepeat = 0;
+// AI can use this class to make sound effects
+class SoundGenerator extends Sound 
+{
+    constructor(params = {})
+    {
+        const {
+            volume = 1,        // Volume scale (percent)
+            randomness = .05,  // How much to randomize frequency (percent Hz)
+            frequency = 220,   // Frequency of sound (Hz)
+            attack = 0,        // Attack time, how fast sound starts (seconds)
+            release = .1,      // Release time, how fast sound fades out (seconds)
+            shapeCurve = 1,    // Squarenes of wave (0=square, 1=normal, 2=pointy)
+            slide = 0,         // How much to slide frequency (kHz/s)
+            pitchJump = 0,     // Frequency of pitch jump (Hz)
+            pitchJumpTime = 0, // Time of pitch jump (seconds)
+            repeatTime = 0,    // Resets some parameters periodically (seconds)
+            noise = 0,         // How much random noise to add (percent)
+            bitCrush = 0,      // Resamples at a lower frequency in (samples*100)
+            delay = 0,         // Overlap sound with itself for reverb and flanger effects (seconds)
+        } = params;
+        
+        super([volume, randomness, frequency, attack, 0, release, 0, shapeCurve, slide, 0, pitchJump, pitchJumpTime, repeatTime, noise, 0, bitCrush, delay, 1, 0, 0, 0]);
+    }
+}
 
-// Piece state
-let bag = [];
-let cur = null;         // {type, rot, x, y}
-let nextType = 0;
-let holdType = 0;
-let holdUsed = false;
+////////////////////////////////////////////////////////////////////////////////
+// TETRIS
+////////////////////////////////////////////////////////////////////////////////
 
-// Visuals
-const COLORS = [
-  rgb(0,0,0,0),      // 0 empty
-  rgb(0,1,1),        // I
-  rgb(0,0,1),        // J
-  rgb(1,.5,0),       // L
-  rgb(1,1,0),        // O
-  rgb(0,1,0),        // S
-  rgb(.6,0,1),       // T
-  rgb(1,0,0),        // Z
+// board
+const BOARD_W = 10;
+const BOARD_H = 20;
+
+// layout in world space
+const boardOrigin = vec2(-9, -10);                     // bottom-left corner of board
+const boardCenter = boardOrigin.add(vec2(BOARD_W/2, BOARD_H/2));
+const panelX = 6.2;
+
+// timing
+const SOFT_DROP_INTERVAL = 0.035;
+const LOCK_DELAY = 0.45;
+const DAS = 0.16;   // delayed auto shift
+const ARR = 0.05;   // auto repeat rate
+
+// scoring
+const SCORE_TABLE = [0, 100, 300, 500, 800];
+
+// piece definitions (4x4 local coords)
+const PIECE_NAMES = ['I','J','L','O','S','T','Z'];
+const PIECE_BASE = [
+    [vec2(0,1), vec2(1,1), vec2(2,1), vec2(3,1)], // I
+    [vec2(0,2), vec2(0,1), vec2(1,1), vec2(2,1)], // J
+    [vec2(2,2), vec2(0,1), vec2(1,1), vec2(2,1)], // L
+    [vec2(1,2), vec2(2,2), vec2(1,1), vec2(2,1)], // O
+    [vec2(1,2), vec2(2,2), vec2(0,1), vec2(1,1)], // S
+    [vec2(1,2), vec2(0,1), vec2(1,1), vec2(2,1)], // T
+    [vec2(0,2), vec2(1,2), vec2(1,1), vec2(2,1)], // Z
 ];
 
-// Tetromino definitions as 4 rotation states of 4 blocks (x,y) in a 4x4
-// Coordinates are in [0..3], origin top-left.
-// Types: 1..7
-const SHAPES = {
-  1: [ // I
-    [[0,1],[1,1],[2,1],[3,1]],
-    [[2,0],[2,1],[2,2],[2,3]],
-    [[0,2],[1,2],[2,2],[3,2]],
-    [[1,0],[1,1],[1,2],[1,3]],
-  ],
-  2: [ // J
-    [[0,0],[0,1],[1,1],[2,1]],
-    [[1,0],[2,0],[1,1],[1,2]],
-    [[0,1],[1,1],[2,1],[2,2]],
-    [[1,0],[1,1],[0,2],[1,2]],
-  ],
-  3: [ // L
-    [[2,0],[0,1],[1,1],[2,1]],
-    [[1,0],[1,1],[1,2],[2,2]],
-    [[0,1],[1,1],[2,1],[0,2]],
-    [[0,0],[1,0],[1,1],[1,2]],
-  ],
-  4: [ // O
-    [[1,0],[2,0],[1,1],[2,1]],
-    [[1,0],[2,0],[1,1],[2,1]],
-    [[1,0],[2,0],[1,1],[2,1]],
-    [[1,0],[2,0],[1,1],[2,1]],
-  ],
-  5: [ // S
-    [[1,0],[2,0],[0,1],[1,1]],
-    [[1,0],[1,1],[2,1],[2,2]],
-    [[1,1],[2,1],[0,2],[1,2]],
-    [[0,0],[0,1],[1,1],[1,2]],
-  ],
-  6: [ // T
-    [[1,0],[0,1],[1,1],[2,1]],
-    [[1,0],[1,1],[2,1],[1,2]],
-    [[0,1],[1,1],[2,1],[1,2]],
-    [[1,0],[0,1],[1,1],[1,2]],
-  ],
-  7: [ // Z
-    [[0,0],[1,0],[1,1],[2,1]],
-    [[2,0],[1,1],[2,1],[1,2]],
-    [[0,1],[1,1],[1,2],[2,2]],
-    [[1,0],[0,1],[1,1],[0,2]],
-  ],
-};
+const PIECE_COLORS = [
+    hsl(.55, 1, .62), // I
+    hsl(.63, 1, .62), // J
+    hsl(.10, 1, .60), // L
+    hsl(.15, 1, .62), // O
+    hsl(.33, 1, .58), // S
+    hsl(.83, 1, .62), // T
+    hsl(.00, 1, .62), // Z
+];
 
-function resetGame() {
-  board = Array.from({length:H}, ()=> Array(W).fill(0));
-  score = 0; lines = 0; level = 1;
-  gameOver = false; pausedLocal = false;
-  fallTimer = 0; lockTimer = 0;
-  moveRepeatL = moveRepeatR = softRepeat = 0;
-  bag = [];
-  holdType = 0; holdUsed = false;
-  nextType = pullFromBag();
-  spawnPiece();
-}
+function rotateCWCoord(p) { return vec2(3 - p.y, p.x); }
+function rotateCCWCoord(p){ return vec2(p.y, 3 - p.x); }
 
-function shuffle(a) {
-  for (let i=a.length-1; i>0; --i) {
-    const j = (rand(i+1)|0);
-    const t = a[i]; a[i] = a[j]; a[j] = t;
-  }
-  return a;
-}
-
-function pullFromBag() {
-  if (!bag.length) bag = shuffle([1,2,3,4,5,6,7]);
-  return bag.pop();
-}
-
-function spawnPiece() {
-  const type = nextType;
-  nextType = pullFromBag();
-  cur = {type, rot:0, x:3, y:-1};
-  holdUsed = false;
-  lockTimer = 0;
-  if (collides(cur.x, cur.y, cur.rot, cur.type)) {
-    gameOver = true;
-  }
-}
-
-function getBlocks(x, y, rot, type) {
-  return SHAPES[type][rot].map(p=> ({x:x+p[0], y:y+p[1]}));
-}
-
-function collides(x, y, rot, type) {
-  const blocks = getBlocks(x,y,rot,type);
-  for (const b of blocks) {
-    if (b.x < 0 || b.x >= W) return true;
-    if (b.y >= H) return true;
-    if (b.y >= 0 && board[b.y][b.x]) return true;
-  }
-  return false;
-}
-
-function tryMove(dx, dy) {
-  if (!cur) return false;
-  const nx = cur.x + dx;
-  const ny = cur.y + dy;
-  if (!collides(nx, ny, cur.rot, cur.type)) {
-    cur.x = nx; cur.y = ny;
-    if (dy) lockTimer = 0;
-    return true;
-  }
-  return false;
-}
-
-function tryRotate(dir) {
-  if (!cur) return false;
-  const oldRot = cur.rot;
-  const newRot = (cur.rot + (dir>0?1:3)) & 3;
-
-  // super-simple wall kicks (good enough for a prototype)
-  const kicks = [
-    {x:0,y:0}, {x:-1,y:0}, {x:1,y:0}, {x:-2,y:0}, {x:2,y:0}, {x:0,y:-1},
-  ];
-  for (const k of kicks) {
-    if (!collides(cur.x+k.x, cur.y+k.y, newRot, cur.type)) {
-      cur.x += k.x; cur.y += k.y; cur.rot = newRot;
-      lockTimer = 0;
-      return true;
+function genRotations(base)
+{
+    const rots = [];
+    let coords = base.map(p=>p.copy());
+    for (let i=0; i<4; ++i)
+    {
+        rots.push(coords.map(p=>p.copy()));
+        coords = coords.map(rotateCWCoord);
     }
-  }
-
-  cur.rot = oldRot;
-  return false;
+    return rots;
 }
 
-function hardDrop() {
-  if (!cur) return;
-  let dropped = 0;
-  while (tryMove(0,1)) dropped++;
-  if (dropped) score += dropped * 2;
-  lockPiece();
+const PIECE_ROTS = PIECE_BASE.map(genRotations);
+
+////////////////////////////////////////////////////////////////////////////////
+// FX: particles, flashes, shake
+////////////////////////////////////////////////////////////////////////////////
+
+const particles = [];
+const lineFlashes = []; // {y, t}
+
+let shakeTime = 0;
+let shakeStrength = 0;
+let landPulse = 0; // little squash pulse when locking
+
+function addShake(strength, duration)
+{
+    shakeStrength = max(shakeStrength, strength);
+    shakeTime = max(shakeTime, duration);
 }
 
-function hold() {
-  if (!cur || holdUsed) return;
-  const t = cur.type;
-  if (!holdType) {
-    holdType = t;
-    spawnPiece();
-  } else {
-    cur = {type:holdType, rot:0, x:3, y:-1};
-    holdType = t;
+function spawnParticles(worldPos, baseColor, count, speed, size, life, upwardBias=0)
+{
+    for (let i=0; i<count; ++i)
+    {
+        const a = rand(2*PI);
+        const r = speed * (0.35 + rand() * 0.65);
+        let v = vec2(Math.cos(a), Math.sin(a)).scale(r);
+        v.y += upwardBias;
+
+        const c = baseColor.copy();
+        c.a = 1;
+
+        particles.push({
+            p: worldPos.copy(),
+            v,
+            s: size * (0.55 + rand() * 0.9),
+            t: life * (0.55 + rand() * 0.9),
+            t0: life,
+            c,
+            spin: (randSign() * (2 + rand()*6)),
+            ang: rand(2*PI),
+        });
+    }
+}
+
+function spawnImpactForBlocks(blocks, type, strength=1)
+{
+    const c = PIECE_COLORS[type];
+    for (const b of blocks)
+    {
+        if (b.y < 0 || b.y >= BOARD_H) continue;
+        const wp = boardOrigin.add(vec2(b.x + .5, b.y + .5));
+        spawnParticles(wp, c, 4*strength|0, 6 + 4*strength, 0.13, 0.35, 3);
+    }
+}
+
+function spawnLineClearFX(rowsCleared)
+{
+    for (const y of rowsCleared)
+    {
+        lineFlashes.push({y, t: 0.22});
+
+        // burst across the row
+        for (let x=0; x<BOARD_W; ++x)
+        {
+            const type = board[y][x];
+            const c = (type === -1 ? hsl(0,0,1) : PIECE_COLORS[type]);
+            const wp = boardOrigin.add(vec2(x + .5, y + .5));
+            spawnParticles(wp, c, 5, 10, 0.12, 0.42, 5);
+        }
+    }
+
+    addShake(0.5 + 0.3*rowsCleared.length, 0.22);
+}
+
+function updateFX()
+{
+    // particles
+    for (let i=particles.length-1; i>=0; --i)
+    {
+        const pt = particles[i];
+        pt.t -= timeDelta;
+        if (pt.t <= 0)
+        {
+            particles.splice(i, 1);
+            continue;
+        }
+
+        // integrate
+        pt.p = pt.p.add(pt.v.scale(timeDelta));
+
+        // little gravity downward
+        pt.v = pt.v.add(vec2(0, -20).scale(timeDelta));
+
+        // drag
+        pt.v = pt.v.scale(1 - min(1, 2.2*timeDelta));
+
+        // spin
+        pt.ang += pt.spin * timeDelta;
+    }
+
+    // flashes
+    for (let i=lineFlashes.length-1; i>=0; --i)
+    {
+        lineFlashes[i].t -= timeDelta;
+        if (lineFlashes[i].t <= 0)
+            lineFlashes.splice(i, 1);
+    }
+
+    // shake
+    if (shakeTime > 0)
+    {
+        shakeTime -= timeDelta;
+        if (shakeTime <= 0)
+        {
+            shakeTime = 0;
+            shakeStrength = 0;
+        }
+        else
+            shakeStrength = max(0, shakeStrength - 2.2*timeDelta);
+    }
+
+    // landing pulse
+    landPulse = max(0, landPulse - 3.5*timeDelta);
+}
+
+function renderFXWorld()
+{
+    // flashes on cleared lines
+    for (const f of lineFlashes)
+    {
+        const alpha = clamp(f.t / 0.22, 0, 1);
+        const y = f.y;
+        const p = boardOrigin.add(vec2(BOARD_W/2, y + .5));
+        const c = hsl(0,0,1);
+        c.a = 0.55 * alpha;
+        drawRect(p, vec2(BOARD_W, 1), c);
+    }
+
+    // particles
+    for (const pt of particles)
+    {
+        const a = clamp(pt.t / pt.t0, 0, 1);
+        const c = pt.c.copy();
+        c.a = a;
+
+        // shrink as it fades
+        const s = pt.s * (0.55 + 0.45*a);
+
+        // simple "diamond" spark
+        const dir = vec2(Math.cos(pt.ang), Math.sin(pt.ang));
+        drawLine(pt.p.add(dir.scale(s*1.2)), pt.p.add(dir.scale(-s*1.2)), s*0.6, c);
+        drawLine(pt.p.add(vec2(-dir.y, dir.x).scale(s*1.2)), pt.p.add(vec2(-dir.y, dir.x).scale(-s*1.2)), s*0.6, c);
+
+        // tiny core
+        drawRect(pt.p, vec2(s*0.6), c.scale(.9));
+    }
+}
+
+// state
+let board;
+let active;
+let nextType;
+let holdType;
+let holdUsed;
+let bag;
+
+let fallTimer;
+let lockTimer;
+let score;
+let lines;
+let level;
+let gameOver;
+
+// input repeat
+let leftNextRepeat = 0;
+let rightNextRepeat = 0;
+
+// sounds
+let sMove, sRotate, sLock, sLine, sTetris, sHold, sOver;
+
+function makeSounds()
+{
+    sMove   = new SoundGenerator({volume:.35, frequency:420, attack:0, release:.06, shapeCurve:1.2});
+    sRotate = new SoundGenerator({volume:.40, frequency:620, attack:0, release:.08, shapeCurve:.9});
+    sLock   = new SoundGenerator({volume:.45, frequency:140, attack:0, release:.10, shapeCurve:1.6, noise:.1});
+    sLine   = new SoundGenerator({volume:.60, frequency:520, attack:0, release:.16, shapeCurve:1.0, slide:-.4});
+    sTetris = new SoundGenerator({volume:.75, frequency:420, attack:0, release:.30, shapeCurve:.7, slide:.6});
+    sHold   = new SoundGenerator({volume:.40, frequency:300, attack:0, release:.10, shapeCurve:1.1});
+    sOver   = new SoundGenerator({volume:.70, frequency:110, attack:0, release:.50, shapeCurve:1.9, slide:-.6, noise:.2});
+}
+
+function emptyBoard()
+{
+    board = [];
+    for (let y=0; y<BOARD_H; ++y)
+        board.push(new Array(BOARD_W).fill(-1));
+}
+
+function shuffle(array)
+{
+    for (let i=array.length-1; i>0; --i)
+    {
+        const j = randInt(i+1);
+        const t = array[i];
+        array[i] = array[j];
+        array[j] = t;
+    }
+}
+
+function refillBag()
+{
+    bag = [0,1,2,3,4,5,6];
+    shuffle(bag);
+}
+
+function popBag()
+{
+    if (!bag || !bag.length)
+        refillBag();
+    return bag.pop();
+}
+
+function levelFallInterval()
+{
+    // simple curve
+    return max(0.10, 0.80 - (level-1) * 0.055);
+}
+
+function spawnPiece(type)
+{
+    active = {
+        type,
+        rot: 0,
+        pos: vec2(3, BOARD_H - 4), // fits inside 0..19
+    };
+    fallTimer = 0;
     lockTimer = 0;
-    if (collides(cur.x, cur.y, cur.rot, cur.type)) gameOver = true;
-  }
-  holdUsed = true;
-}
 
-function lockPiece() {
-  if (!cur) return;
-  const blocks = getBlocks(cur.x, cur.y, cur.rot, cur.type);
-  for (const b of blocks) {
-    if (b.y < 0) { gameOver = true; continue; }
-    board[b.y][b.x] = cur.type;
-  }
-  clearLines();
-  spawnPiece();
-}
+    // game over if the spawn collides
+    if (collides(active.pos, active.rot, active.type))
+    {
+        gameOver = true;
+        sOver && sOver.play();
 
-function clearLines() {
-  let cleared = 0;
-  for (let y=H-1; y>=0; --y) {
-    if (board[y].every(v=>v)) {
-      board.splice(y,1);
-      board.unshift(Array(W).fill(0));
-      cleared++;
-      y++; // re-check same row index after pull down
+        // explode from top
+        const wp = boardOrigin.add(vec2(BOARD_W/2, BOARD_H - 2));
+        spawnParticles(wp, hsl(0,0,1), 160, 12, 0.14, 0.65, 10);
+        addShake(1.2, 0.5);
     }
-  }
-  if (!cleared) return;
-
-  lines += cleared;
-  level = 1 + (lines/10|0);
-
-  // Scoring similar-ish to guideline (not exact NES)
-  const lineScore = [0, 100, 300, 500, 800][cleared] || 0;
-  score += lineScore * level;
 }
 
-function fallInterval() {
-  // faster as level increases, clamped
-  return max(0.05, 0.8 - (level-1)*0.06);
+function restartGame()
+{
+    emptyBoard();
+    refillBag();
+    holdType = -1;
+    holdUsed = false;
+    score = 0;
+    lines = 0;
+    level = 1;
+    gameOver = false;
+
+    // clear fx
+    particles.length = 0;
+    lineFlashes.length = 0;
+    shakeTime = 0;
+    shakeStrength = 0;
+    landPulse = 0;
+
+    nextType = popBag();
+    spawnPiece(popBag());
 }
 
-function lockDelay() {
-  return 0.5; // seconds you can keep moving/rotating after touching ground
+function getBlocks(pos, rot, type)
+{
+    const coords = PIECE_ROTS[type][mod(rot,4)];
+    return coords.map(p=>vec2(pos.x + p.x, pos.y + p.y));
 }
 
-// ---- LittleJS callbacks ----
-function gameInit() {
-  // Fixed canvas so it always looks consistent
-  setCanvasFixedSize(vec2(820, 960));
-  setInputPreventDefault(true);
-  setCameraPos(vec2());
-  cameraScale = 1;
-  resetGame();
-}
-
-function gameUpdate() {
-  if (keyWasPressed('KeyP')) pausedLocal = !pausedLocal;
-  if (keyWasPressed('KeyR')) resetGame();
-
-  if (pausedLocal || gameOver) return;
-
-  // movement: initial press + repeat when held
-  const repDelay = 0.16;
-  const repRate  = 0.05;
-
-  const leftDown  = keyIsDown('ArrowLeft');
-  const rightDown = keyIsDown('ArrowRight');
-
-  if (keyWasPressed('ArrowLeft')) { tryMove(-1,0); moveRepeatL = repDelay; }
-  if (keyWasPressed('ArrowRight')){ tryMove( 1,0); moveRepeatR = repDelay; }
-
-  if (leftDown && !rightDown) {
-    moveRepeatL -= timeDelta;
-    if (moveRepeatL <= 0) { tryMove(-1,0); moveRepeatL += repRate; }
-  } else moveRepeatL = 0;
-
-  if (rightDown && !leftDown) {
-    moveRepeatR -= timeDelta;
-    if (moveRepeatR <= 0) { tryMove(1,0); moveRepeatR += repRate; }
-  } else moveRepeatR = 0;
-
-  // rotation
-  if (keyWasPressed('KeyZ')) tryRotate(-1);
-  if (keyWasPressed('KeyX') || keyWasPressed('ArrowUp')) tryRotate(1);
-
-  // hold
-  if (keyWasPressed('KeyC')) hold();
-
-  // hard drop
-  if (keyWasPressed('Space')) hardDrop();
-
-  // soft drop
-  const softDown = keyIsDown('ArrowDown');
-  if (keyWasPressed('ArrowDown')) { tryMove(0,1); score += 1; softRepeat = 0.03; }
-  if (softDown) {
-    softRepeat -= timeDelta;
-    if (softRepeat <= 0) {
-      if (tryMove(0,1)) score += 1;
-      softRepeat = 0.03;
+function collides(pos, rot, type)
+{
+    const blocks = getBlocks(pos, rot, type);
+    for (const b of blocks)
+    {
+        if (b.x < 0 || b.x >= BOARD_W) return true;
+        if (b.y < 0) return true;
+        if (b.y >= BOARD_H) continue; // allow above top
+        if (board[b.y][b.x] !== -1) return true;
     }
-  }
+    return false;
+}
 
-  // gravity
-  fallTimer += timeDelta;
-  const interval = fallInterval();
-  if (fallTimer >= interval) {
-    fallTimer -= interval;
-    if (!tryMove(0,1)) {
-      // touching ground
-      lockTimer += interval;
-      if (lockTimer >= lockDelay()) lockPiece();
+function tryMove(dx, dy)
+{
+    const newPos = vec2(active.pos.x + dx, active.pos.y + dy);
+    if (!collides(newPos, active.rot, active.type))
+    {
+        active.pos = newPos;
+        if (dx)
+        {
+            sMove && sMove.play();
+
+            // tiny trail
+            const blocks = getBlocks(active.pos, active.rot, active.type);
+            const c = PIECE_COLORS[active.type];
+            for (const b of blocks)
+            {
+                if (b.y < 0 || b.y >= BOARD_H) continue;
+                const wp = boardOrigin.add(vec2(b.x + .5 - dx*0.35, b.y + .5));
+                spawnParticles(wp, c, 1, 4, 0.10, 0.20, 1);
+            }
+        }
+        lockTimer = 0;
+        return true;
     }
-  }
-  else {
-    // if we're currently touching ground, count lock delay time too
-    if (cur && collides(cur.x, cur.y+1, cur.rot, cur.type)) {
-      lockTimer += timeDelta;
-      if (lockTimer >= lockDelay()) lockPiece();
-    } else {
-      lockTimer = 0;
+    return false;
+}
+
+function tryRotate(dir) // dir=+1 cw, -1 ccw
+{
+    const newRot = mod(active.rot + (dir>0?1:3), 4);
+
+    // simple kick table
+    const kicks = [
+        vec2(0,0), vec2(1,0), vec2(-1,0), vec2(0,1), vec2(0,-1),
+        vec2(2,0), vec2(-2,0)
+    ];
+
+    for (const k of kicks)
+    {
+        const newPos = active.pos.add(k);
+        if (!collides(newPos, newRot, active.type))
+        {
+            active.rot = newRot;
+            active.pos = newPos;
+            sRotate && sRotate.play();
+
+            // spin sparks around the piece center
+            const center = boardOrigin.add(vec2(active.pos.x + 2, active.pos.y + 2));
+            spawnParticles(center, PIECE_COLORS[active.type], 14, 8, 0.12, 0.28, 3);
+
+            lockTimer = 0;
+            return true;
+        }
     }
-  }
+
+    return false;
 }
 
-function gameUpdatePost() {
-  // no camera stuff needed (we render in screen space)
+function isResting()
+{
+    return collides(vec2(active.pos.x, active.pos.y - 1), active.rot, active.type);
 }
 
-function drawRectScreen(pos, size, color) {
-  // drawTile supports screenSpace, and tileInfo can be undefined for untextured rects
-  drawTile(pos, size, undefined, color, 0, false, undefined, false, true);
+function hardDrop()
+{
+    let d = 0;
+    while (!collides(vec2(active.pos.x, active.pos.y - 1), active.rot, active.type))
+    {
+        active.pos.y -= 1;
+        d++;
+
+        // streak spark occasionally
+        if ((d & 1) === 0)
+        {
+            const c = PIECE_COLORS[active.type];
+            const blocks = getBlocks(active.pos, active.rot, active.type);
+            for (const b of blocks)
+            {
+                if (b.y < 0 || b.y >= BOARD_H) continue;
+                const wp = boardOrigin.add(vec2(b.x + .5, b.y + .5 + .5));
+                spawnParticles(wp, c, 1, 5, 0.10, 0.18, 2);
+            }
+        }
+    }
+    if (d) score += d * 2;
+
+    // stronger impact shake
+    addShake(0.45 + d*0.01, 0.14);
+
+    lockPiece(true);
 }
 
-function drawCell(x, y, type, origin, cell, pad=2) {
-  const px = origin.x + x*cell + cell/2;
-  const py = origin.y + y*cell + cell/2;
-  const s = cell - pad;
-  drawRectScreen(vec2(px, py), vec2(s, s), COLORS[type]);
+function holdPiece()
+{
+    if (holdUsed) return;
+    holdUsed = true;
+    sHold && sHold.play();
+
+    // puff
+    const center = boardOrigin.add(vec2(active.pos.x + 2, active.pos.y + 2));
+    spawnParticles(center, PIECE_COLORS[active.type], 22, 9, 0.13, 0.32, 5);
+
+    const currentType = active.type;
+    if (holdType === -1)
+    {
+        holdType = currentType;
+        spawnPiece(nextType);
+        nextType = popBag();
+    }
+    else
+    {
+        active.type = holdType;
+        holdType = currentType;
+        active.rot = 0;
+        active.pos = vec2(3, BOARD_H - 4);
+        fallTimer = 0;
+        lockTimer = 0;
+
+        if (collides(active.pos, active.rot, active.type))
+        {
+            gameOver = true;
+            sOver && sOver.play();
+        }
+    }
 }
 
-function computeLayout() {
-  const cell = min(40, (mainCanvasSize.y - 160) / H);
-  const boardPxW = W * cell;
-  const boardPxH = H * cell;
-  // Keep the board on the left and reserve space for the sidebar UI
-  const origin = vec2(60, mainCanvasSize.y/2 - boardPxH/2 + 30);
-  return {cell, boardPxW, boardPxH, origin};
+function lockPiece(fromHardDrop=false)
+{
+    const blocks = getBlocks(active.pos, active.rot, active.type);
+    for (const b of blocks)
+    {
+        if (b.y >= BOARD_H)
+        {
+            gameOver = true;
+            sOver && sOver.play();
+            return;
+        }
+        board[b.y][b.x] = active.type;
+    }
+
+    // impact FX
+    spawnImpactForBlocks(blocks, active.type, fromHardDrop ? 2 : 1);
+    landPulse = 1;
+    addShake(fromHardDrop ? 0.35 : 0.18, fromHardDrop ? 0.14 : 0.10);
+
+    sLock && !fromHardDrop && sLock.play();
+
+    // clear lines
+    let cleared = 0;
+    const clearedRows = [];
+    for (let y=0; y<BOARD_H; ++y)
+    {
+        let full = true;
+        for (let x=0; x<BOARD_W; ++x)
+            if (board[y][x] === -1) { full = false; break; }
+
+        if (full)
+        {
+            cleared++;
+            clearedRows.push(y);
+            for (let yy=y; yy<BOARD_H-1; ++yy)
+                board[yy] = board[yy+1];
+            board[BOARD_H-1] = new Array(BOARD_W).fill(-1);
+            y--; // recheck this row index
+        }
+    }
+
+    if (cleared)
+    {
+        lines += cleared;
+        level = 1 + (lines/10|0);
+        score += SCORE_TABLE[cleared] * level;
+        (cleared === 4 ? sTetris : sLine)?.play();
+
+        spawnLineClearFX(clearedRows);
+    }
+
+    // next
+    holdUsed = false;
+    spawnPiece(nextType);
+    nextType = popBag();
 }
 
-function ghostY() {
-  if (!cur) return cur?.y ?? 0;
-  let y = cur.y;
-  while (!collides(cur.x, y+1, cur.rot, cur.type)) y++;
-  return y;
+function ghostY()
+{
+    let y = active.pos.y;
+    while (!collides(vec2(active.pos.x, y-1), active.rot, active.type))
+        y--;
+    return y;
 }
 
-function gameRender() {
-  // background
-  drawRectScreen(mainCanvasSize.scale(.5), mainCanvasSize, rgb(.03,.03,.04));
+function drawCell(x, y, color, scale=1)
+{
+    const p = boardOrigin.add(vec2(x + .5, y + .5));
+    const s = vec2(.98*scale);
+    drawRect(p, s, color);
+    // subtle inner
+    drawRect(p, s.scale(.80), color.scale(.88));
+
+    // little highlight line
+    drawLine(p.add(vec2(-.35*scale, .35*scale)), p.add(vec2(.35*scale, .35*scale)), .06*scale, color.scale(1.2));
 }
 
-function drawMini(type, topLeft, cell) {
-  // 4x4 mini grid
-  const bgSize = vec2(cell*4 + 16, cell*4 + 16);
-  drawRectScreen(topLeft.add(bgSize.scale(.5)), bgSize, rgb(.08,.08,.1));
-
-  const blocks = SHAPES[type][0];
-  for (const b of blocks) {
-    const x = b[0], y = b[1];
-    const px = topLeft.x + 8 + x*cell + cell/2;
-    const py = topLeft.y + 8 + y*cell + cell/2;
-    drawRectScreen(vec2(px, py), vec2(cell-2, cell-2), COLORS[type]);
-  }
+function drawPieceAt(type, rot, pos, alpha=1, scale=1)
+{
+    const blocks = getBlocks(pos, rot, type);
+    const c = PIECE_COLORS[type].copy();
+    c.a *= alpha;
+    for (const b of blocks)
+    {
+        if (b.y < 0 || b.y >= BOARD_H) continue;
+        drawCell(b.x, b.y, c, scale);
+    }
 }
 
-function gameRenderPost() {
-  const {cell, boardPxW, boardPxH, origin} = computeLayout();
+function drawMiniPiece(type, rot, centerWorld, scale=0.7)
+{
+    const blocks = PIECE_ROTS[type][mod(rot,4)];
+    const c = PIECE_COLORS[type];
+    const s = vec2(scale);
 
-  // board frame
-  drawRectScreen(origin.add(vec2(boardPxW/2, boardPxH/2)), vec2(boardPxW+10, boardPxH+10), rgb(.15,.15,.2));
-  drawRectScreen(origin.add(vec2(boardPxW/2, boardPxH/2)), vec2(boardPxW, boardPxH), rgb(.02,.02,.03));
+    // center the 4x4 around the given point
+    const base = centerWorld.add(vec2(-2*scale, -2*scale));
+    for (const p of blocks)
+    {
+        const wp = base.add(vec2((p.x + .5)*scale*1, (p.y + .5)*scale*1));
+        drawRect(wp, s.scale(.92), c);
+        drawRect(wp, s.scale(.72), c.scale(.88));
+    }
+}
 
-  // settled blocks
-  for (let y=0; y<H; ++y)
-  for (let x=0; x<W; ++x)
-    if (board[y][x]) drawCell(x,y,board[y][x],origin,cell);
+function handleRepeat(dirKey, dir)
+{
+    const isDown = keyIsDown(dirKey);
+    const wasPressed = keyWasPressed(dirKey);
 
-  // ghost piece
-  if (cur && !gameOver) {
+    if (wasPressed)
+    {
+        tryMove(dir, 0);
+        if (dir < 0) leftNextRepeat = time + DAS;
+        else rightNextRepeat = time + DAS;
+    }
+
+    if (!isDown)
+    {
+        if (dir < 0) leftNextRepeat = 0;
+        else rightNextRepeat = 0;
+        return;
+    }
+
+    const nextT = dir < 0 ? leftNextRepeat : rightNextRepeat;
+    if (nextT && time >= nextT)
+    {
+        tryMove(dir, 0);
+        const t = time + ARR;
+        if (dir < 0) leftNextRepeat = t;
+        else rightNextRepeat = t;
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Minimal self-tests (console asserts)
+////////////////////////////////////////////////////////////////////////////////
+
+function runSelfTests()
+{
+    // rotations and blocks
+    console.assert(PIECE_ROTS.length === 7, 'Expected 7 piece types');
+    for (let t=0; t<7; ++t)
+    {
+        console.assert(PIECE_ROTS[t].length === 4, 'Expected 4 rotations for ' + PIECE_NAMES[t]);
+        for (let r=0; r<4; ++r)
+            console.assert(PIECE_ROTS[t][r].length === 4, 'Expected 4 blocks for ' + PIECE_NAMES[t] + ' rot ' + r);
+    }
+
+    // bag contains all pieces
+    refillBag();
+    const seen = new Set(bag);
+    console.assert(seen.size === 7, 'Bag should contain 7 unique pieces');
+
+    // collision bounds sanity (requires board)
+    emptyBoard();
+    const testType = 3; // O
+    console.assert(collides(vec2(-1, 0), 0, testType) === true, 'Should collide left out of bounds');
+    console.assert(collides(vec2(0, -2), 0, testType) === true, 'Should collide below board');
+    console.assert(collides(vec2(3, BOARD_H-4), 0, testType) === false, 'Spawn position should be valid on empty board');
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameInit()
+{
+    setShowSplashScreen(false);
+    setCanvasFixedSize(vec2(960, 720));
+    setFontDefault('monospace');
+
+    makeSounds();
+    restartGame();
+    runSelfTests();
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameUpdate()
+{
+    // FX always update (even on game over)
+    updateFX();
+
+    if (gameOver)
+    {
+        if (keyWasPressed('KeyR'))
+            restartGame();
+        return;
+    }
+
+    // movement (with repeat)
+    handleRepeat('ArrowLeft', -1);
+    handleRepeat('ArrowRight', 1);
+
+    // rotation
+    if (keyWasPressed('ArrowUp') || keyWasPressed('KeyX'))
+        tryRotate(1);
+    if (keyWasPressed('KeyZ'))
+        tryRotate(-1);
+
+    // hold
+    if (keyWasPressed('KeyC') || keyWasPressed('ShiftLeft') || keyWasPressed('ShiftRight'))
+        holdPiece();
+
+    // hard drop
+    if (keyWasPressed('Space'))
+        hardDrop();
+
+    // gravity
+    const softDrop = keyIsDown('ArrowDown');
+    fallTimer += timeDelta;
+
+    const fallInterval = softDrop ? SOFT_DROP_INTERVAL : levelFallInterval();
+    while (fallTimer >= fallInterval)
+    {
+        fallTimer -= fallInterval;
+        if (tryMove(0, -1))
+        {
+            if (softDrop)
+            {
+                score += 1;
+
+                // small falling trail
+                const blocks = getBlocks(active.pos, active.rot, active.type);
+                const c = PIECE_COLORS[active.type];
+                for (const b of blocks)
+                {
+                    if (b.y < 0 || b.y >= BOARD_H) continue;
+                    const wp = boardOrigin.add(vec2(b.x + .5, b.y + .5 + .4));
+                    spawnParticles(wp, c, 1, 4, 0.10, 0.16, 1);
+                }
+            }
+        }
+        else
+            break;
+    }
+
+    // lock delay when resting
+    if (isResting())
+    {
+        lockTimer += timeDelta;
+        if (lockTimer >= LOCK_DELAY)
+            lockPiece(false);
+    }
+    else
+        lockTimer = 0;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameUpdatePost()
+{
+    // camera shake
+    if (shakeTime > 0)
+    {
+        const s = shakeStrength;
+        cameraPos = vec2((rand()*2-1)*s, (rand()*2-1)*s);
+    }
+    else
+        cameraPos = vec2(0, 0);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameRender()
+{
+    // background
+    drawRect(cameraPos, vec2(200, 200), rgb(.05,.05,.06));
+
+    // board frame
+    drawRect(boardCenter, vec2(BOARD_W + .45, BOARD_H + .45), rgb(.18,.18,.20));
+    drawRect(boardCenter, vec2(BOARD_W + .10, BOARD_H + .10), rgb(.09,.09,.11));
+
+    // subtle grid
+    for (let x=0; x<=BOARD_W; ++x)
+    {
+        const a = boardOrigin.add(vec2(x, 0));
+        const b = boardOrigin.add(vec2(x, BOARD_H));
+        drawLine(a, b, .04, rgb(.12,.12,.14));
+    }
+    for (let y=0; y<=BOARD_H; ++y)
+    {
+        const a = boardOrigin.add(vec2(0, y));
+        const b = boardOrigin.add(vec2(BOARD_W, y));
+        drawLine(a, b, .04, rgb(.12,.12,.14));
+    }
+
+    // locked blocks
+    for (let y=0; y<BOARD_H; ++y)
+    for (let x=0; x<BOARD_W; ++x)
+    {
+        const t = board[y][x];
+        if (t !== -1)
+            drawCell(x, y, PIECE_COLORS[t], 1);
+    }
+
+    // ghost
     const gy = ghostY();
-    const ghostBlocks = getBlocks(cur.x, gy, cur.rot, cur.type);
-    for (const b of ghostBlocks) {
-      if (b.y < 0) continue;
-      const px = origin.x + b.x*cell + cell/2;
-      const py = origin.y + b.y*cell + cell/2;
-      drawRectScreen(vec2(px, py), vec2(cell-6, cell-6), rgb(1,1,1,.12));
+    drawPieceAt(active.type, active.rot, vec2(active.pos.x, gy), .25, 1);
+
+    // active piece (tiny idle pulse)
+    const pulse = 1 + 0.02*Math.sin(time*8);
+    drawPieceAt(active.type, active.rot, active.pos, 1, pulse);
+
+    // render FX over the board
+    renderFXWorld();
+
+    // landing pulse overlay (quick squash ring at the bottom of piece)
+    if (landPulse > 0)
+    {
+        const blocks = getBlocks(active.pos, active.rot, active.type);
+        let minY = 1e9;
+        for (const b of blocks) minY = min(minY, b.y);
+        const alpha = clamp(landPulse, 0, 1);
+        const c = PIECE_COLORS[active.type].copy();
+        c.a = 0.22 * alpha;
+        const y = clamp(minY, 0, BOARD_H-1);
+        const p = boardOrigin.add(vec2(BOARD_W/2, y + .5));
+        drawRect(p, vec2(BOARD_W, 1 + 0.35*(1-alpha)), c);
     }
-  }
 
-  // active piece
-  if (cur) {
-    const blocks = getBlocks(cur.x, cur.y, cur.rot, cur.type);
-    for (const b of blocks) {
-      if (b.y < 0) continue;
-      drawCell(b.x, b.y, cur.type, origin, cell);
-    }
-  }
+    // panel background
+    drawRect(vec2(panelX, 0), vec2(7.5, 20.5), rgb(.08,.08,.10));
+    drawRect(vec2(panelX, 0), vec2(7.2, 20.2), rgb(.06,.06,.08));
 
-  // UI
-  const uiX = origin.x + boardPxW + 40;
-  const uiTop = origin.y;
-  const textColor = rgb(1,1,1);
+    // labels in world space
+    drawText('NEXT', vec2(panelX, 8.8), 0.8, hsl(0,0,1), 0.15, hsl(0,0,0), 'center');
+    drawText('HOLD', vec2(panelX, 2.8), 0.8, hsl(0,0,1), 0.15, hsl(0,0,0), 'center');
 
-  drawTextScreen('Running…', vec2(70, 30), 26, rgb(.8,.9,1), 4, rgb(0,0,0));
+    // next + hold mini pieces
+    drawMiniPiece(nextType, 0, vec2(panelX, 6.6), 0.75);
+    if (holdType !== -1)
+        drawMiniPiece(holdType, 0, vec2(panelX, 0.6), 0.75);
 
-  drawTextScreen('SCORE', vec2(uiX+60, uiTop+10), 22, textColor, 4, rgb(0,0,0), 'left');
-  drawTextScreen(String(score), vec2(uiX+60, uiTop+36), 26, rgb(1,1,0.7), 4, rgb(0,0,0), 'left');
-
-  drawTextScreen('LINES', vec2(uiX+60, uiTop+76), 22, textColor, 4, rgb(0,0,0), 'left');
-  drawTextScreen(String(lines), vec2(uiX+60, uiTop+102), 26, rgb(.8,1,.8), 4, rgb(0,0,0), 'left');
-
-  drawTextScreen('LEVEL', vec2(uiX+60, uiTop+142), 22, textColor, 4, rgb(0,0,0), 'left');
-  drawTextScreen(String(level), vec2(uiX+60, uiTop+168), 26, rgb(.8,.8,1), 4, rgb(0,0,0), 'left');
-
-  // Next + Hold boxes
-  const miniCell = max(14, min(22, cell*0.6));
-
-  drawTextScreen('NEXT', vec2(uiX+60, uiTop+220), 22, textColor, 4, rgb(0,0,0), 'left');
-  drawMini(nextType, vec2(uiX+60, uiTop+240), miniCell);
-
-  drawTextScreen('HOLD (C)', vec2(uiX+60, uiTop+360), 22, textColor, 4, rgb(0,0,0), 'left');
-  if (holdType) drawMini(holdType, vec2(uiX+60, uiTop+380), miniCell);
-  else drawRectScreen(vec2(uiX+60 + (miniCell*4+16)/2, uiTop+380 + (miniCell*4+16)/2), vec2(miniCell*4+16, miniCell*4+16), rgb(.08,.08,.1));
-
-  // Controls
-  const help =
-    '←/→ move   ↓ soft\n' +
-    'Z/X or ↑ rotate\n' +
-    'Space hard drop\n' +
-    'C hold   P pause\n' +
-    'R restart';
-  drawTextScreen(help, vec2(uiX+60, uiTop+540), 18, rgb(.9,.9,.95), 4, rgb(0,0,0), 'left');
-
-  if (pausedLocal && !gameOver) {
-    drawRectScreen(mainCanvasSize.scale(.5), vec2(mainCanvasSize.x, 140), rgb(0,0,0,.6));
-    drawTextScreen('PAUSED', mainCanvasSize.scale(.5), 60, rgb(1,1,1), 6, rgb(0,0,0));
-    drawTextScreen('Press P to resume', mainCanvasSize.scale(.5).add(vec2(0,50)), 22, rgb(.8,.8,1), 4, rgb(0,0,0));
-  }
-
-  if (gameOver) {
-    drawRectScreen(mainCanvasSize.scale(.5), vec2(mainCanvasSize.x, 200), rgb(0,0,0,.75));
-    drawTextScreen('GAME OVER', mainCanvasSize.scale(.5).add(vec2(0,-20)), 64, rgb(1,.35,.35), 8, rgb(0,0,0));
-    drawTextScreen('Press R to restart', mainCanvasSize.scale(.5).add(vec2(0,60)), 26, rgb(1,1,1), 4, rgb(0,0,0));
-  }
+    // stats (use \n, do not put literal newlines inside quotes)
+    drawText('SCORE\n' + score, vec2(panelX, -4.2), 0.7, hsl(0,0,1), 0.12, hsl(0,0,0));
+    drawText('LEVEL\n' + level, vec2(panelX, -7.2), 0.7, hsl(0,0,1), 0.12, hsl(0,0,0));
+    drawText('LINES\n' + lines, vec2(panelX, -10.2), 0.7, hsl(0,0,1), 0.12, hsl(0,0,0));
 }
 
-// Startup
+///////////////////////////////////////////////////////////////////////////////
+function gameRenderPost()
+{
+    // controls overlay
+    const p = vec2(mainCanvasSize.x/2, mainCanvasSize.y - 26);
+    drawTextScreen('←/→ move   ↓ soft   ↑/X rotate   Z ccw   Space hard   C hold   R restart',
+        p, 18, hsl(0,0,1,.75), 4, hsl(0,0,0,.6));
+
+    if (gameOver)
+    {
+        drawTextScreen('GAME OVER', vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 - 40), 78, hsl(0,0,1), 10, hsl(0,0,0));
+        drawTextScreen('Press R to Restart', vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 + 30), 32, hsl(0,0,1), 8, hsl(0,0,0));
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Startup LittleJS Engine
 engineInit(gameInit, gameUpdate, gameUpdatePost, gameRender, gameRenderPost);
+
 </script>
 </body>
 </html>

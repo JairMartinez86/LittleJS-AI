@@ -1,0 +1,381 @@
+<!DOCTYPE html><head>
+<title>LittleJS AI Starter Project</title>
+<meta charset=utf-8>
+</head><body style="background:#000">
+<script src="https://cdn.jsdelivr.net/npm/littlejsengine@1.17.15/dist/littlejs.js"></script>
+<script>
+'use strict';
+
+// engine settings, do not remove
+debugWatermark = false; // Hide debug watermark in corner
+showEngineVersion = false; // Hide engine version console display
+
+// AI can use this class to make sound effects
+class SoundGenerator extends Sound 
+{
+    constructor(params = {})
+    {
+        const {
+            volume = 1,        // Volume scale (percent)
+            randomness = .05,  // How much to randomize frequency (percent Hz)
+            frequency = 220,   // Frequency of sound (Hz)
+            attack = 0,        // Attack time, how fast sound starts (seconds)
+            release = .1,      // Release time, how fast sound fades out (seconds)
+            shapeCurve = 1,    // Squarenes of wave (0=square, 1=normal, 2=pointy)
+            slide = 0,         // How much to slide frequency (kHz/s)
+            pitchJump = 0,     // Frequency of pitch jump (Hz)
+            pitchJumpTime = 0, // Time of pitch jump (seconds)
+            repeatTime = 0,    // Resets some parameters periodically (seconds)
+            noise = 0,         // How much random noise to add (percent)
+            bitCrush = 0,      // Resamples at a lower frequency in (samples*100)
+            delay = 0,         // Overlap sound with itself for reverb and flanger effects (seconds)
+        } = params;
+        
+        super([volume, randomness, frequency, attack, 0, release, shapeCurve, slide, pitchJump, pitchJumpTime, repeatTime, noise, 0, bitCrush, delay, 1, 0, 0, 0]);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameInit()
+{
+    // World / camera setup
+    cameraScale = 26;
+    cameraPos = vec2(0, 0);
+
+    // Disable built-in object gravity/physics (we're doing simple custom physics)
+    gravity = vec2(0, 0);
+
+    initSounds();
+    resetGame();
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameUpdate()
+{
+    updateInput();
+    updateBallPhysics();
+    updateBucket();
+
+    // Simple "dead" check
+    if (activeBall && activeBall.pos.y < -boardSize.y/2 - 4)
+        loseBall();
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameUpdatePost()
+{
+    // Keep camera centered
+    cameraPos = vec2(0, 0);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameRender()
+{
+    // Background board
+    drawRectGradient(vec2(0,0), boardSize, hsl(.58,.6,.12), hsl(.58,.6,.06));
+
+    // Side walls
+    const wallH = boardSize.y;
+    drawRect(vec2(-boardSize.x/2-.15, 0), vec2(.3, wallH+4), hsl(0,0,0));
+    drawRect(vec2( boardSize.x/2+.15, 0), vec2(.3, wallH+4), hsl(0,0,0));
+
+    // Pegs
+    for (const p of pegs)
+    {
+        if (p.hit) continue;
+        drawCircle(p.pos, p.r*2, p.color, .12, hsl(0,0,0)); // drawCircle size is diameter
+    }
+
+    // Bucket
+    drawRect(bucket.pos, bucket.size, hsl(.15,.8,.5));
+
+    // Cannon + aim line
+    drawCircle(cannonPos, .35*2, hsl(.08,.7,.6), .08, hsl(0,0,0));
+    if (!gameOver && ballsRemaining > 0 && !activeBall)
+    {
+        const dir = aimDir;
+        const a = cannonPos;
+        const b = cannonPos.add(dir.scale(6));
+        drawLine(a, b, .12, hsl(.12,.1,1));
+        drawCircle(b, .12*2, hsl(.12,.1,1));
+    }
+
+    // Ball
+    if (activeBall)
+        drawCircle(activeBall.pos, activeBall.r*2, hsl(.55,.7,.7), .1, hsl(0,0,0)); // drawCircle size is diameter
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameRenderPost()
+{
+    // UI (screen space)
+    const ui = [];
+    ui.push(`Score: ${score}`);
+    ui.push(`Balls: ${ballsRemaining}${activeBall ? ' (in play)' : ''}`);
+    ui.push(`Orange Left: ${orangeLeft}`);
+
+    if (gameOver)
+        ui.push(win ? 'YOU WIN!  (Press R to restart)' : 'Game Over  (Press R to restart)');
+    else
+        ui.push('Aim with mouse, click / Space to shoot');
+
+    drawTextScreen(ui.join('\n'), vec2(mainCanvasSize.x/2, 40), 32,
+        hsl(0,0,1), 4, hsl(0,0,0));
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Peggle-ish game (custom lightweight physics, no external libraries)
+// Note: Box2D can't be pulled in here because this project is constrained to LittleJS only.
+
+const BALL_R = .55; // Peggle-ish ball radius (world units)
+
+let boardSize, cannonPos, aimDir;
+let pegs, bucket, activeBall;
+let score, ballsRemaining, orangeLeft, win, gameOver;
+
+let sfxShoot, sfxPeg, sfxOrange, sfxBucket, sfxLose;
+
+function initSounds()
+{
+    // short, snappy bleeps
+    sfxShoot  = new SoundGenerator({frequency: 420, release: .08, volume: .8, shapeCurve: 1.4});
+    sfxPeg    = new SoundGenerator({frequency: 520, release: .10, volume: .7, slide: -.4});
+    sfxOrange = new SoundGenerator({frequency: 740, release: .12, volume: .9, slide: .6});
+    sfxBucket = new SoundGenerator({frequency: 260, release: .16, volume: .9, noise: .1});
+    sfxLose   = new SoundGenerator({frequency: 140, release: .18, volume: .7, slide: -.6, shapeCurve: .7});
+}
+
+function resetGame()
+{
+    boardSize = vec2(18, 28);
+    cannonPos = vec2(0, boardSize.y/2 - 1.5);
+    aimDir    = vec2(0, -1);
+
+    score = 0;
+    ballsRemaining = 10;
+    activeBall = null;
+    gameOver = false;
+    win = false;
+
+    createPegs();
+    createBucket();
+}
+
+function createPegs()
+{
+    pegs = [];
+    const pegR = .42;
+
+    // Place pegs in a loose grid with jitter, avoiding the cannon area
+    const cols = 9;
+    const rows = 10;
+    const padding = 1.2;
+    const usable = boardSize.subtract(vec2(padding*2, padding*3));
+    const start = vec2(-usable.x/2, -boardSize.y/2 + padding + 3);
+
+    const orangeCount = 12;
+
+    // Make a shuffled list of indices for oranges
+    const indices = [];
+    for (let i=0;i<cols*rows;i++) indices.push(i);
+    for (let i=indices.length-1;i>0;i--)
+    {
+        const j = randInt(i+1);
+        const t = indices[i]; indices[i] = indices[j]; indices[j] = t;
+    }
+    const orangeSet = new Set(indices.slice(0, orangeCount));
+
+    for (let r=0; r<rows; r++)
+    for (let c=0; c<cols; c++)
+    {
+        const i = r*cols + c;
+
+        const x = start.x + usable.x*(c/(cols-1)) + rand(-.35,.35);
+        const y = start.y + usable.y*(r/(rows-1)) + rand(-.25,.25);
+
+        // Skip pegs very close to the cannon or too low (leave room for bucket)
+        if (y > cannonPos.y - 3) continue;
+        if (y < -boardSize.y/2 + 2.4) continue;
+
+        const isOrange = orangeSet.has(i);
+
+        pegs.push({
+            pos: vec2(x,y),
+            r: pegR,
+            hit: false,
+            orange: isOrange,
+            color: isOrange ? hsl(.08,.85,.55) : hsl(.60,.65,.55),
+        });
+    }
+
+    // Ensure orangeLeft matches actual orange pegs
+    orangeLeft = pegs.reduce((a,p)=>a + (p.orange?1:0), 0);
+}
+
+function createBucket()
+{
+    bucket = {
+        pos: vec2(0, -boardSize.y/2 + 1.1),
+        size: vec2(4.2, .8),
+        t: 0
+    };
+}
+
+function updateInput()
+{
+    if (keyWasPressed('KeyR'))
+        resetGame();
+
+    if (gameOver) return;
+
+    // Aim based on mouse
+    const m = mousePos;
+    const toMouse = m.subtract(cannonPos);
+    if (toMouse.length() > .01)
+        aimDir = toMouse.normalize();
+
+    // Clamp aim to downward cone
+    const minAngle = -Math.PI*.93; // roughly left-ish
+    const maxAngle = -Math.PI*.07; // roughly right-ish
+    const ang = Math.atan2(aimDir.y, aimDir.x);
+    const clamped = clamp(ang, minAngle, maxAngle);
+    aimDir = vec2(Math.cos(clamped), Math.sin(clamped));
+
+    // Shoot
+    const shootPressed = mouseWasPressed(0) || keyWasPressed('Space');
+    if (shootPressed && !activeBall && ballsRemaining > 0)
+        shootBall();
+}
+
+function shootBall()
+{
+    ballsRemaining--;
+    activeBall = {
+        pos: cannonPos.add(aimDir.scale(BALL_R + .45)), // spawn just outside the cannon
+        vel: aimDir.scale(22),
+        r: BALL_R,
+    };
+    sfxShoot.play();
+}
+
+function loseBall()
+{
+    activeBall = null;
+    sfxLose.play();
+
+    // End conditions
+    if (orangeLeft <= 0)
+    {
+        win = true;
+        gameOver = true;
+        return;
+    }
+    if (ballsRemaining <= 0)
+    {
+        win = false;
+        gameOver = true;
+    }
+}
+
+function updateBucket()
+{
+    if (gameOver) return;
+
+    bucket.t += timeDelta;
+    const xRange = boardSize.x/2 - bucket.size.x/2 - .6;
+    bucket.pos.x = Math.sin(bucket.t*1.4) * xRange;
+
+    // Catch ball
+    if (!activeBall) return;
+
+    const dx = Math.abs(activeBall.pos.x - bucket.pos.x);
+    const dy = Math.abs(activeBall.pos.y - bucket.pos.y);
+    if (dx < (bucket.size.x/2 + activeBall.r) &&
+        dy < (bucket.size.y/2 + activeBall.r) &&
+        activeBall.vel.y < 0)
+    {
+        score += 2500;
+        ballsRemaining += 1; // free ball!
+        activeBall = null;
+        sfxBucket.play();
+    }
+}
+
+function updateBallPhysics()
+{
+    if (!activeBall || gameOver) return;
+
+    const g = vec2(0, -28);
+    activeBall.vel = activeBall.vel.add(g.scale(timeDelta));
+    activeBall.pos = activeBall.pos.add(activeBall.vel.scale(timeDelta));
+
+    // Walls
+    const left  = -boardSize.x/2 + activeBall.r;
+    const right =  boardSize.x/2 - activeBall.r;
+    if (activeBall.pos.x < left)  { activeBall.pos.x = left;  activeBall.vel.x = Math.abs(activeBall.vel.x); }
+    if (activeBall.pos.x > right) { activeBall.pos.x = right; activeBall.vel.x = -Math.abs(activeBall.vel.x); }
+
+    // Ceiling (soft)
+    const top = boardSize.y/2 - activeBall.r - .2;
+    if (activeBall.pos.y > top) { activeBall.pos.y = top; activeBall.vel.y = -Math.abs(activeBall.vel.y) * .8; }
+
+    // Peg collisions
+    for (const p of pegs)
+    {
+        if (p.hit) continue;
+
+        const d = activeBall.pos.subtract(p.pos);
+        const dist = d.length();
+        const minDist = activeBall.r + p.r;
+
+        if (dist < minDist && dist > 0)
+        {
+            // Separate
+            const n = d.scale(1/dist);
+            activeBall.pos = p.pos.add(n.scale(minDist + .001));
+
+            // Reflect with a little energy loss
+            const v = activeBall.vel;
+            const vn = n.scale(v.dot(n));
+            const vt = v.subtract(vn);
+            activeBall.vel = vt.subtract(vn).scale(.98);
+
+            // Mark hit
+            p.hit = true;
+            if (p.orange)
+            {
+                score += 1000;
+                orangeLeft--;
+                sfxOrange.play();
+                if (orangeLeft <= 0)
+                {
+                    win = true;
+                    gameOver = true;
+                }
+            }
+            else
+            {
+                score += 100;
+                sfxPeg.play();
+            }
+
+            // Small speed floor so it doesn't stall
+            const sp = activeBall.vel.length();
+            if (sp < 8)
+                activeBall.vel = activeBall.vel.normalize().scale(8);
+
+            break; // one peg per frame is enough
+        }
+    }
+}
+
+// Helpers
+function rand(min=0, max=1) { return min + Math.random()*(max-min); }
+function randInt(max) { return (Math.random()*max)|0; }
+function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+
+///////////////////////////////////////////////////////////////////////////////
+// Startup LittleJS Engine
+engineInit(gameInit, gameUpdate, gameUpdatePost, gameRender, gameRenderPost);
+
+</script>

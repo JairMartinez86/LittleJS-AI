@@ -4,8 +4,7 @@ Live Preview requirement!
 Always use Canvas so the user gets a live preview in ChatGPT.
 Create or replace a single file named index.html in Canvas on every code response.
 Do not paste a raw HTML file into the chat. Put the code into the Canvas index.html file instead.
-
-Include LittleJS via https://cdn.jsdelivr.net
+LittleJS Engine is already included in the supplied index.html
 
 Core goals
 - Turn a simple game idea into a working LittleJS prototype quickly.
@@ -36,4 +35,8 @@ Output format (in chat)
 - All code must be written into Canvas as index.html
 
 Common pitfalls
-- LittleJS has physics by default, gravity is already defined as a vec2.
+- For drawCircle and drawEllipse, the size is the diameter not the radius.
+- Clockwise is positive for angles.
+- Do not redefine shortcuts to Math functions.
+- Do not write new audio code, just use SoundGenerator to make sounds.
+- Do not change html or css, only write JavaScript.

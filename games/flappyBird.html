@@ -1,0 +1,329 @@
+<!DOCTYPE html><head>
+<title>LittleJS AI Starter Project</title>
+<meta charset=utf-8>
+</head><body style="background:#000">
+<script src="https://cdn.jsdelivr.net/npm/littlejsengine@1.17.15/dist/littlejs.js"></script>
+<script>
+'use strict';
+
+// engine settings, do not remove
+debugWatermark = false; // Hide debug watermark in corner
+showEngineVersion = false; // Hide engine version console display
+
+// AI can use this class to make sound effects
+class SoundGenerator extends Sound 
+{
+    constructor(params = {})
+    {
+        const {
+            volume = 1,        // Volume scale (percent)
+            randomness = .05,  // How much to randomize frequency (percent Hz)
+            frequency = 220,   // Frequency of sound (Hz)
+            attack = 0,        // Attack time, how fast sound starts (seconds)
+            release = .1,      // Release time, how fast sound fades out (seconds)
+            shapeCurve = 1,    // Squarenes of wave (0=square, 1=normal, 2=pointy)
+            slide = 0,         // How much to slide frequency (kHz/s)
+            pitchJump = 0,     // Frequency of pitch jump (Hz)
+            pitchJumpTime = 0, // Time of pitch jump (seconds)
+            repeatTime = 0,    // Resets some parameters periodically (seconds)
+            noise = 0,         // How much random noise to add (percent)
+            bitCrush = 0,      // Resamples at a lower frequency in (samples*100)
+            delay = 0,         // Overlap sound with itself for reverb and flanger effects (seconds)
+        } = params;
+        
+        super([volume, randomness, frequency, attack, 0, release, 0, shapeCurve, slide, 0, pitchJump, pitchJumpTime, repeatTime, noise, 0, bitCrush, delay, 1, 0, 0, 0]);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Flappy Bird (LittleJS, no external assets)
+
+// World tuning (world units, not pixels)
+const WORLD_H = 12;
+const BIRD_X = -4.2;
+const BIRD_R = 0.38;
+
+const GRAVITY = -18;
+const FLAP_VEL = 6.9;
+
+const PIPE_W = 1.2;
+const PIPE_GAP = 3.9;
+const PIPE_SPACING = 4.5;
+const PIPE_SPEED = 4.6;
+
+// Camera (pixels per world unit)
+const CAMERA_SCALE = 60;
+
+// Game state
+let state;              // 'ready' | 'playing' | 'dead'
+let birdPos;
+let birdVelY;
+let pipes;
+let spawnTimer;
+let score;
+let best;
+
+// Sounds
+let sFlap, sScore, sHit;
+
+function resetToReady()
+{
+    state = 'ready';
+    birdPos = vec2(BIRD_X, WORLD_H/2);
+    birdVelY = 0;
+    pipes = [];
+    spawnTimer = 0;
+    score = 0;
+    best = best ?? 0;
+}
+
+function startRun()
+{
+    state = 'playing';
+    birdPos = vec2(BIRD_X, WORLD_H/2);
+    birdVelY = 0;
+    pipes = [];
+    score = 0;
+
+    // Spawn one pipe immediately, then wait a full spacing interval before the next
+    spawnTimer = PIPE_SPACING / PIPE_SPEED;
+    spawnPipe();
+}
+
+function spawnPipe()
+{
+    const gapMin = PIPE_GAP/2 + 1.2;
+    const gapMax = WORLD_H - PIPE_GAP/2 - 1.2;
+    const gapY = rand(gapMin, gapMax);
+
+    // Spawn just off the right side of the view
+    const viewW = getCameraSize().x;
+    const x = viewW/2 + PIPE_W/2 + 1;
+
+    pipes.push({x, gapY, passed:false});
+}
+
+function die()
+{
+    if (state === 'dead') return;
+    state = 'dead';
+    best = max(best, score);
+    sHit && sHit.play(birdPos, .9, 1);
+}
+
+function flap()
+{
+    if (state === 'dead')
+    {
+        startRun();
+        birdVelY = FLAP_VEL;
+        sFlap && sFlap.play(birdPos, .8, 1);
+        return;
+    }
+
+    if (state === 'ready')
+        startRun();
+
+    if (state === 'playing')
+    {
+        birdVelY = FLAP_VEL;
+        sFlap && sFlap.play(birdPos, .7, 1);
+    }
+}
+
+function inputPressed()
+{
+    // Prefer direct mouse API (also works for touch in most browsers)
+    return keyWasPressed('Space') || keyWasPressed('ArrowUp') || keyWasPressed('KeyW') ||
+           keyWasPressed('Enter') ||
+           mouseWasPressed(0);
+}
+
+function checkPipeCollision(p)
+{
+    const dx = abs(birdPos.x - p.x);
+    if (dx > PIPE_W/2 + BIRD_R)
+        return false;
+
+    const gapTop = p.gapY + PIPE_GAP/2;
+    const gapBottom = p.gapY - PIPE_GAP/2;
+
+    return birdPos.y + BIRD_R > gapTop || birdPos.y - BIRD_R < gapBottom;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameInit()
+{
+    // Fixed 720p canvas for consistent feel
+    setCanvasFixedSize(vec2(1280, 720));
+
+    // Sounds
+    sFlap = new SoundGenerator({frequency: 480, attack: 0, release: .08, shapeCurve: 1.3, randomness: .02});
+    sScore = new SoundGenerator({frequency: 920, attack: 0, release: .12, shapeCurve: 1.6, slide: -0.2, randomness: .01});
+    sHit = new SoundGenerator({frequency: 140, attack: 0, release: .18, shapeCurve: .6, noise: .08, randomness: .05});
+
+    resetToReady();
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameUpdate()
+{
+    if (inputPressed())
+        flap();
+
+    // Ready: gentle bob
+    if (state === 'ready')
+    {
+        birdPos.y = WORLD_H/2 + Math.sin(time*3) * .25;
+        birdVelY = 0;
+        return;
+    }
+
+    // Dead: let bird fall but stop pipes
+    const simPipes = state === 'playing';
+
+    // Bird physics
+    birdVelY += GRAVITY * timeDelta;
+    birdPos.y += birdVelY * timeDelta;
+
+    // Clamp / ground hit
+    if (birdPos.y - BIRD_R < 0)
+    {
+        birdPos.y = BIRD_R;
+        die();
+    }
+    if (birdPos.y + BIRD_R > WORLD_H)
+    {
+        birdPos.y = WORLD_H - BIRD_R;
+        die();
+    }
+
+    // Pipes
+    if (simPipes)
+    {
+        spawnTimer -= timeDelta;
+        if (spawnTimer <= 0)
+        {
+            spawnPipe();
+            spawnTimer += PIPE_SPACING / PIPE_SPEED;
+        }
+
+        for (const p of pipes)
+            p.x -= PIPE_SPEED * timeDelta;
+    }
+
+    // Cleanup offscreen
+    const viewW = getCameraSize().x;
+    const leftCullX = -viewW/2 - PIPE_W - 2;
+    pipes = pipes.filter(p => p.x > leftCullX);
+
+    // Score + collisions
+    for (const p of pipes)
+    {
+        if (state !== 'dead' && checkPipeCollision(p))
+            die();
+
+        if (simPipes && !p.passed && p.x + PIPE_W/2 < birdPos.x)
+        {
+            p.passed = true;
+            score++;
+            sScore && sScore.play(birdPos, .6, 1);
+        }
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameUpdatePost()
+{
+    // Camera setup
+    cameraScale = CAMERA_SCALE;
+    cameraPos = vec2(0, WORLD_H/2);
+    cameraAngle = 0;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameRender()
+{
+    // Background
+    const camSize = getCameraSize();
+    drawRect(cameraPos, camSize.scale(1.2), hsl(.58, .6, .55));
+
+    // Subtle stripes
+    for (let i = -20; i <= 20; ++i)
+    {
+        const x = i * 1.2 + (time * .7 % 1.2);
+        drawRect(vec2(x, WORLD_H/2), vec2(.1, WORLD_H*2), hsl(.58, .35, .65, .15));
+    }
+
+    // Ground
+    drawRect(vec2(0, -.5), vec2(200, 1), hsl(.12, .6, .25));
+
+    // Pipes
+    for (const p of pipes)
+    {
+        const gapTop = p.gapY + PIPE_GAP/2;
+        const gapBottom = p.gapY - PIPE_GAP/2;
+
+        const topH = WORLD_H - gapTop;
+        if (topH > 0)
+        {
+            const topCenter = vec2(p.x, gapTop + topH/2);
+            drawRect(topCenter, vec2(PIPE_W, topH), hsl(.33, .65, .35));
+            drawRect(vec2(p.x, gapTop + .2), vec2(PIPE_W*1.18, .4), hsl(.33, .7, .28));
+        }
+
+        const botH = gapBottom;
+        if (botH > 0)
+        {
+            const botCenter = vec2(p.x, botH/2);
+            drawRect(botCenter, vec2(PIPE_W, botH), hsl(.33, .65, .35));
+            drawRect(vec2(p.x, gapBottom - .2), vec2(PIPE_W*1.18, .4), hsl(.33, .7, .28));
+        }
+    }
+
+    // Bird (rotate body + face parts together)
+    const tilt = clamp(-birdVelY / 10, -0.8, 0.8);
+    const rot = (o)=>{
+        // LittleJS uses clockwise-positive angles, so rotate offsets clockwise
+        const c = Math.cos(tilt), s = Math.sin(tilt);
+        return vec2(o.x*c + o.y*s, -o.x*s + o.y*c);
+    };
+
+    // Body
+    drawEllipse(birdPos, vec2(BIRD_R*2, BIRD_R*1.6), hsl(.12, .9, .55), tilt);
+
+    // Eye (white + pupil)
+    drawCircle(birdPos.add(rot(vec2(.12, .1))), .14, WHITE);
+    drawCircle(birdPos.add(rot(vec2(.16, .1))), .07, BLACK);
+
+    // Beak
+    drawRect(birdPos.add(rot(vec2(.26, -.05))), vec2(.18, .12), hsl(.02, .9, .55), tilt);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameRenderPost()
+{
+    // Score
+    if (state !== 'ready')
+        drawTextScreen(score.toString(), vec2(mainCanvasSize.x/2, 85), 92, WHITE, 8, BLACK);
+
+    // UI text
+    if (state === 'ready')
+    {
+        drawTextScreen('FLAPPY (LittleJS)', vec2(mainCanvasSize.x/2, 120), 80, WHITE, 8, BLACK);
+        drawTextScreen('Space / Click / Tap to flap', vec2(mainCanvasSize.x/2, 210), 44, WHITE, 6, BLACK);
+        drawTextScreen('Get through the gaps!', vec2(mainCanvasSize.x/2, 265), 34, WHITE, 5, BLACK);
+    }
+    else if (state === 'dead')
+    {
+        drawTextScreen('GAME OVER', vec2(mainCanvasSize.x/2, 200), 80, hsl(0, .9, .6), 10, BLACK);
+        drawTextScreen(`Score: ${score}   Best: ${best}`, vec2(mainCanvasSize.x/2, 275), 42, WHITE, 6, BLACK);
+        drawTextScreen('Press Space / Click to restart', vec2(mainCanvasSize.x/2, 340), 36, WHITE, 5, BLACK);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Startup LittleJS Engine
+engineInit(gameInit, gameUpdate, gameUpdatePost, gameRender, gameRenderPost);
+
+</script>
