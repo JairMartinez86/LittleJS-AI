@@ -1,590 +1,705 @@
-<!DOCTYPE html>
-<head>
-  <title>LittleJS Breakout</title>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1.0, user-scalable=no" />
-  <meta name=apple-mobile-web-app-capable content=yes>
-  <meta name=mobile-web-app-capable content=yes>
-  <style>
-    html, body { margin:0; padding:0; background:#0b0f1a; overflow:hidden; }
-    canvas { display:block; margin:0 auto; }
-  </style>
-</head>
-<body>
-  <script src="https://cdn.jsdelivr.net/npm/littlejsengine@1.17.11/dist/littlejs.min.js"></script>
-  <script>
-  'use strict';
-
-  // AI can use this class to generate sounds (from LittleJS starter template)
-  class SoundGenerator extends Sound
-  {
-      constructor(params = {})
-      {
-          const {
-              volume = 1,        // Volume scale (percent)
-              randomness = .05,  // How much to randomize frequency (percent Hz)
-              frequency = 220,   // Frequency of sound (Hz)
-              attack = 0,        // Attack time, how fast sound starts (seconds)
-              release = .1,      // Release time, how fast sound fades out (seconds)
-              shapeCurve = 1,    // Squareness of wave (0=square, 1=normal, 2=pointy)
-              slide = 0,         // How much to slide frequency (kHz/s)
-              pitchJump = 0,     // Frequency of pitch jump (Hz)
-              pitchJumpTime = 0, // Time of pitch jump (seconds)
-              repeatTime = 0,    // Resets some parameters periodically (seconds)
-              noise = 0,         // How much random noise to add (percent)
-              bitCrush = 0,      // Resamples at a lower frequency in (samples*100)
-              delay = 0,         // Overlap sound with itself for reverb and flanger effects (seconds)
-          } = params;
-          super([volume, randomness, frequency, attack, 0, release, 0, shapeCurve, slide, 0, pitchJump, pitchJumpTime, repeatTime, noise, 0, bitCrush, delay, 1, 0, 0, 0]);
-      }
-  }
-
-  ///////////////////////////////////////////////////////////////////////////////
-  // Breakout: simple, no textures, solid-color primitives only.
-
-  const levelSize = vec2(38, 22);
-  const wallThickness = .5;
-
-  const paddleSize = vec2(6, .7);
-  const paddleY = 1.6;
-  const paddleSpeed = 24;
-
-  const ballRadius = .35;
-  const ballBaseSpeed = 17;
-  const ballMaxSpeed  = 28;
-
-  const brickRows = 6;
-  const brickCols = 10;
-  const brickGap  = .18;
-  const brickTopMargin = 3.2;
-  const brickCellH = 1.1;
-
-  // break effect
-  const maxParticles = 450;
-  const particleGravity = -18;
-
-  // game state
-  let paddle, ball, bricks;
-  let score, lives;
-  let ballSpeed;
-  let ballStuck;
-  let gameOver, youWin;
-
-  // particles
-  let particles = [];
-
-  // sounds
-  let sWall, sPaddle, sBrick, sLose, sWin;
-
-  // helpers (avoid clashing with LittleJS globals like clamp)
-  const customClamp01 = (t)=> max(0, min(1, t));
-  const customClamp = (v,a,b)=> max(a, min(b, v));
-  const signNoZero = (v)=> v < 0 ? -1 : 1;
-
-  // LittleJS doesn't guarantee a global vec3 helper, so we use a tiny plain RGB object.
-  const makeRGB = (r=1,g=1,b=1)=> ({x:r, y:g, z:b});
-
-  // LittleJS colors may be Color(r,g,b,a) or vec3/vec4-ish depending on helper used.
-  // Normalize to our {x,y,z} RGB object so particle tinting always matches the brick.
-  function colorRGB(c)
-  {
-      if (!c) return makeRGB(1,1,1);
-
-      // LittleJS Color
-      if (c.r !== undefined) return makeRGB(c.r, c.g, c.b);
-
-      // vec-style
-      if (c.x !== undefined) return makeRGB(c.x, c.y, c.z ?? c.w ?? 1);
-
-      // arrays
-      if (Array.isArray(c) && c.length >= 3) return makeRGB(c[0], c[1], c[2]);
-
-      return makeRGB(1,1,1);
-  }
-
-  const withAlpha = (c, a)=> { const v = colorRGB(c); return rgb(v.x, v.y, v.z, a); };
-
-  // brighten a color by adding a bit of white, keeping everything in [0,1]
-  const brighten = (c, amt, a=1)=>
-  {
-      const v = colorRGB(c);
-      return rgb(min(1, v.x + amt), min(1, v.y + amt), min(1, v.z + amt), a);
-  };
-
-  // basic sanity tests (run once in gameInit)
-  function runTests()
-  {
-      const eps = 1e-9;
-      const assert = (cond, msg)=> { if (!cond) throw new Error('Test failed: ' + msg); };
-      const near = (a,b)=> Math.abs(a-b) <= eps;
-
-      assert(customClamp(5, 0, 3) === 3, 'customClamp upper bound');
-      assert(customClamp(-2, 0, 3) === 0, 'customClamp lower bound');
-      assert(customClamp(2, 0, 3) === 2, 'customClamp pass-through');
-      assert(near(customClamp01(-1), 0), 'customClamp01 low');
-      assert(near(customClamp01(2), 1), 'customClamp01 high');
-
-      // color helpers should not default to white for HSL colors
-      const testC = hsl(.2,.8,.6);
-      const testV = colorRGB(testC);
-      assert(testV.x >= 0 && testV.x <= 1 && testV.y >= 0 && testV.y <= 1 && testV.z >= 0 && testV.z <= 1, 'colorRGB returns sane range');
-
-      // also support vec-style objects
-      const v2 = colorRGB({x:.1,y:.2,z:.3});
-      assert(near(v2.x, .1) && near(v2.y, .2) && near(v2.z, .3), 'colorRGB supports {x,y,z}');
-
-      // particle spawn should add entries and carry the tint
-      particles = [];
-      spawnBrickBreakEffect({pos: vec2(10,10), size: vec2(2,1), color: testC});
-      assert(particles.length > 0, 'spawnBrickBreakEffect adds particles');
-      const flash = particles.find(p=> p.kind == 'flash');
-      assert(!!flash && !!flash.color, 'flash particle has color');
-      const fv = colorRGB(flash.color);
-      assert(!(fv.x == 1 && fv.y == 1 && fv.z == 1), 'flash particle should not be pure white by default');
-  }
-
-  function resolveCircleAABB(ball, rectPos, rectSize)
-  {
-      const r = ball.r;
-      const hx = rectSize.x/2, hy = rectSize.y/2;
-      const dx = ball.pos.x - rectPos.x;
-      const dy = ball.pos.y - rectPos.y;
-
-      const px = hx + r - abs(dx);
-      const py = hy + r - abs(dy);
-      if (px <= 0 || py <= 0) return false;
-
-      if (px < py)
-      {
-          ball.pos.x += px * signNoZero(dx);
-          ball.vel.x *= -1;
-          return 'x';
-      }
-      else
-      {
-          ball.pos.y += py * signNoZero(dy);
-          ball.vel.y *= -1;
-          return 'y';
-      }
-  }
-
-  function resetBall(stick=true)
-  {
-      ballSpeed = ballBaseSpeed;
-      ball.r = ballRadius;
-      ball.vel = vec2(0,0);
-      ballStuck = stick;
-      if (ballStuck)
-          ball.pos = vec2(paddle.pos.x, paddle.pos.y + paddle.size.y/2 + ball.r + .12);
-  }
-
-  function launchBall()
-  {
-      if (!ballStuck || gameOver || youWin) return;
-      ballStuck = false;
-      const dir = vec2(rand(-.8,.8), 1).normalize();
-      ball.vel = dir.scale(ballSpeed);
-      sPaddle.play(undefined, .7, 1.2);
-  }
-
-  function buildBricks()
-  {
-      bricks = [];
-      const left = 1;
-      const width = levelSize.x - 2;
-      const cellW = width / brickCols;
-      const brickW = cellW - brickGap;
-      const brickH = .85;
-      const yStart = levelSize.y - brickTopMargin;
-
-      for (let row=0; row<brickRows; row++)
-      for (let col=0; col<brickCols; col++)
-      {
-          const x = left + (col+.5)*cellW;
-          const y = yStart - row*brickCellH;
-          bricks.push({
-              pos: vec2(x,y),
-              size: vec2(brickW, brickH),
-              color: hsl(row/brickRows, .75, .55),
-              alive: true,
-          });
-      }
-  }
-
-  function resetGame(full=true)
-  {
-      score = full ? 0 : score;
-      lives = full ? 3 : lives;
-      gameOver = false;
-      youWin = false;
-
-      paddle = { pos: vec2(levelSize.x/2, paddleY), size: paddleSize.copy() };
-      ball = { pos: vec2(levelSize.x/2, paddleY + 2), vel: vec2(), r: ballRadius };
-
-      particles = [];
-      buildBricks();
-      resetBall(true);
-  }
-
-  function allBricksCleared()
-  {
-      for (const b of bricks)
-          if (b.alive) return false;
-      return true;
-  }
-
-  ///////////////////////////////////////////////////////////////////////////////
-  // Brick break effect (untextured particles + small flash ring)
-
-  function pushParticle(p)
-  {
-      if (particles.length >= maxParticles)
-          particles.splice(0, particles.length - maxParticles + 1);
-      particles.push(p);
-  }
-
-  function spawnBrickBreakEffect(brick)
-  {
-      // store tint as {x,y,z} so rendering is consistent
-      const c = colorRGB(brick.color);
-      const base = vec2(brick.size.x/2, brick.size.y/2);
-
-      // sparks
-      const count = 18;
-      for (let i=0; i<count; i++)
-      {
-          const a = rand(0, 2*PI);
-          const speed = rand(4, 13);
-          const vel = vec2(Math.cos(a), Math.sin(a)).scale(speed);
-          const p = {
-              kind: 'spark',
-              pos: brick.pos.add(vec2(rand(-base.x, base.x), rand(-base.y, base.y))),
-              vel,
-              life: rand(.25, .55),
-              lifeMax: 1,
-              size: rand(.08, .18),
-              color: c,
-          };
-          p.lifeMax = p.life;
-          pushParticle(p);
-      }
-
-      // chunk rectangles (heavier pieces)
-      const chunks = 6;
-      for (let i=0; i<chunks; i++)
-      {
-          const vel = vec2(rand(-5,5), rand(3,10));
-          const p = {
-              kind: 'chunk',
-              pos: brick.pos.add(vec2(rand(-base.x, base.x), rand(-base.y, base.y))),
-              vel,
-              life: rand(.35, .75),
-              lifeMax: 1,
-              size: vec2(rand(.18,.34), rand(.10,.22)),
-              color: c,
-          };
-          p.lifeMax = p.life;
-          pushParticle(p);
-      }
-
-      // flash ring (tinted to the brick)
-      pushParticle({
-          kind: 'flash',
-          pos: brick.pos.copy(),
-          vel: vec2(0,0),
-          life: .12,
-          lifeMax: .12,
-          radius: max(brick.size.x, brick.size.y)*.55,
-          color: c,
-      });
-  }
-
-  function updateParticles()
-  {
-      if (!particles.length) return;
-
-      for (let i = particles.length; i--;)
-      {
-          const p = particles[i];
-          p.life -= timeDelta;
-          if (p.life <= 0)
-          {
-              particles.splice(i, 1);
-              continue;
-          }
-
-          // flash doesn't move
-          if (p.kind !== 'flash')
-          {
-              p.vel.y += particleGravity * timeDelta;
-              p.vel = p.vel.scale(1 - customClamp01(5*timeDelta));
-              p.pos = p.pos.add(p.vel.scale(timeDelta));
-          }
-      }
-  }
-
-  function renderParticles()
-  {
-      for (const p of particles)
-      {
-          const t = customClamp01(p.life / p.lifeMax);
-
-          if (p.kind === 'flash')
-          {
-              const a = .55 * t;
-              // outer ring
-              drawCircle(p.pos, (p.radius*2) * (1.15 - .15*t), withAlpha(p.color, a));
-              // inner glow (tinted to the brick color)
-              drawCircle(p.pos, (p.radius*2) * (.65 + .25*t), brighten(p.color, .35, a*.25));
-              continue;
-          }
-
-          // brighten as it fades
-          const a = .85 * t;
-          const col = withAlpha(p.color, a);
-
-          if (p.kind === 'chunk')
-          {
-              drawRect(p.pos, p.size.scale(.6 + .5*t), col);
-              drawRect(p.pos.add(vec2(0,.03)), p.size.scale(vec2(.55,.35)).scale(.6 + .5*t), brighten(p.color, .45, a*.16));
-          }
-          else
-          {
-              // spark
-              drawCircle(p.pos, (p.size*2) * (.6 + .8*t), col);
-          }
-      }
-  }
-
-  ///////////////////////////////////////////////////////////////////////////////
-  function gameInit()
-  {
-      setShowSplashScreen(false);
-      setEnablePhysicsSolver(false);
-      setCanvasFixedSize(vec2(1280, 720));
-      setCanvasClearColor(hsl(.62, .55, .08));
-      setFontDefault('monospace');
-
-      // Run quick internal tests (visible in console)
-      try { runTests(); console.log('Breakout tests: OK'); }
-      catch (e) { console.error(e); }
-
-      // Sound palette
-      sWall   = new SoundGenerator({frequency: 320, release: .06, shapeCurve: 1.2, randomness: .03});
-      sPaddle = new SoundGenerator({frequency: 210, release: .07, shapeCurve: .9, slide: .6, randomness: .04});
-      sBrick  = new SoundGenerator({frequency: 700, release: .08, shapeCurve: 1.6, bitCrush: .8, randomness: .06});
-      sLose   = new SoundGenerator({frequency: 110, release: .25, shapeCurve: 2.2, noise: .25, slide: -.3});
-      sWin    = new SoundGenerator({frequency: 420, release: .35, shapeCurve: 1.1, slide: 1.2, delay: .08});
-
-      resetGame(true);
-  }
-
-  ///////////////////////////////////////////////////////////////////////////////
-  function gameUpdate()
-  {
-      // launch / restart
-      if ((mouseWasPressed(0) || keyWasPressed('Space')))
-      {
-          if (gameOver || youWin)
-          {
-              resetGame(true);
-              launchBall();
-          }
-          else
-              launchBall();
-      }
-
-      // paddle control: mouse + keyboard fallback
-      const targetX = mousePos.x;
-      let x = paddle.pos.x;
-
-      // keyboard nudges
-      const move = (keyIsDown('ArrowRight') || keyIsDown('KeyD') ? 1 : 0) - (keyIsDown('ArrowLeft') || keyIsDown('KeyA') ? 1 : 0);
-      if (move)
-          x += move * paddleSpeed * timeDelta;
-      else
-          x = lerp(x, targetX, customClamp01(14*timeDelta));
-
-      const half = paddle.size.x/2;
-      paddle.pos.x = customClamp(x, wallThickness + half, levelSize.x - wallThickness - half);
-
-      // stick ball to paddle until launched
-      if (ballStuck)
-      {
-          ball.pos.x = paddle.pos.x;
-          ball.pos.y = paddle.pos.y + paddle.size.y/2 + ball.r + .12;
-      }
-
-      // ball simulation
-      if (!ballStuck && !(gameOver || youWin))
-      {
-          // integrate
-          ball.pos = ball.pos.add(ball.vel.scale(timeDelta));
-
-          // walls (left/right)
-          if (ball.pos.x - ball.r < wallThickness)
-          {
-              ball.pos.x = wallThickness + ball.r;
-              ball.vel.x = abs(ball.vel.x);
-              sWall.play(undefined, .5);
-          }
-          if (ball.pos.x + ball.r > levelSize.x - wallThickness)
-          {
-              ball.pos.x = levelSize.x - wallThickness - ball.r;
-              ball.vel.x = -abs(ball.vel.x);
-              sWall.play(undefined, .5);
-          }
-          // ceiling
-          if (ball.pos.y + ball.r > levelSize.y - wallThickness)
-          {
-              ball.pos.y = levelSize.y - wallThickness - ball.r;
-              ball.vel.y = -abs(ball.vel.y);
-              sWall.play(undefined, .5);
-          }
-
-          // bottom (lose life)
-          if (ball.pos.y + ball.r < 0)
-          {
-              lives--;
-              sLose.play(undefined, .9);
-              if (lives <= 0)
-                  gameOver = true;
-              resetBall(true);
-          }
-          else
-          {
-              // paddle collision
-              if (resolveCircleAABB(ball, paddle.pos, paddle.size))
-              {
-                  // always bounce up from paddle
-                  ball.vel.y = abs(ball.vel.y);
-
-                  // apply english based on where it hit
-                  const t = customClamp((ball.pos.x - paddle.pos.x) / (paddle.size.x/2), -1, 1);
-                  const angleMix = 0.85;
-                  ball.vel.x = lerp(ball.vel.x, t * ballSpeed * 1.15, angleMix);
-
-                  // keep a stable speed
-                  ballSpeed = min(ballMaxSpeed, ballSpeed + .02);
-                  ball.vel = ball.vel.normalize().scale(ballSpeed);
-
-                  sPaddle.play(undefined, .7, 1 + .35*abs(t), 1);
-              }
-
-              // brick collisions (simple: first hit per frame)
-              for (const b of bricks)
-              {
-                  if (!b.alive) continue;
-                  const axis = resolveCircleAABB(ball, b.pos, b.size);
-                  if (!axis) continue;
-
-                  b.alive = false;
-                  score += 10;
-
-                  // break effect (tinted to this brick)
-                  spawnBrickBreakEffect(b);
-
-                  // speed up a bit with each brick
-                  ballSpeed = min(ballMaxSpeed, ballSpeed + .35);
-                  ball.vel = ball.vel.normalize().scale(ballSpeed);
-
-                  // pitch shifts slightly by row
-                  const pitch = 0.9 + 0.03 * (score/10 % 12);
-                  sBrick.play(undefined, .65, pitch);
-                  break;
-              }
-
-              // win condition
-              if (allBricksCleared())
-              {
-                  youWin = true;
-                  sWin.play(undefined, 1);
-                  resetBall(true);
-              }
-          }
-      }
-
-      // particles always update (even during stuck / win / lose screens)
-      updateParticles();
-  }
-
-  ///////////////////////////////////////////////////////////////////////////////
-  function gameUpdatePost()
-  {
-      // fit camera to the playfield
-      const scale = min(mainCanvasSize.x / levelSize.x, mainCanvasSize.y / (levelSize.y + 2));
-      setCameraScale(scale);
-      setCameraPos(vec2(levelSize.x/2, levelSize.y/2));
-  }
-
-  ///////////////////////////////////////////////////////////////////////////////
-  function gameRender()
-  {
-      // background frame
-      const bg = hsl(.62, .35, .12);
-      drawRect(vec2(levelSize.x/2, levelSize.y/2), levelSize, bg);
-
-      // walls
-      const wallColor = hsl(.58, .25, .22);
-      // left
-      drawRect(vec2(wallThickness/2, levelSize.y/2), vec2(wallThickness, levelSize.y), wallColor);
-      // right
-      drawRect(vec2(levelSize.x - wallThickness/2, levelSize.y/2), vec2(wallThickness, levelSize.y), wallColor);
-      // top
-      drawRect(vec2(levelSize.x/2, levelSize.y - wallThickness/2), vec2(levelSize.x, wallThickness), wallColor);
-  }
-
-  ///////////////////////////////////////////////////////////////////////////////
-  function gameRenderPost()
-  {
-      // bricks
-      for (const b of bricks)
-      {
-          if (!b.alive) continue;
-          drawRect(b.pos, b.size, b.color);
-          // subtle highlight (fixed light, not part of break effect)
-          drawRect(b.pos.add(vec2(0,.08)), b.size.scale(vec2(.98,.55)), rgb(1,1,1,.08));
-      }
-
-      // particles behind paddle/ball feels nice
-      renderParticles();
-
-      // paddle
-      drawRect(paddle.pos, paddle.size, hsl(.12, .7, .55));
-      drawRect(paddle.pos.add(vec2(0,.06)), paddle.size.scale(vec2(.92,.55)), rgb(1,1,1,.12));
-
-      // ball
-      drawCircle(ball.pos, ball.r*2, hsl(.08, .1, .92));
-      drawCircle(ball.pos.add(vec2(-.08,.08)), ball.r*1.15, rgb(1,1,1,.15));
-
-      // HUD (screen space)
-      drawTextScreen(`Score: ${score}`, vec2(120, 38), 34, hsl(0,0,1), 4, hsl(0,0,0), 'left');
-      drawTextScreen(`Lives: ${lives}`, vec2(mainCanvasSize.x-120, 38), 34, hsl(0,0,1), 4, hsl(0,0,0), 'right');
-
-      // messages
-      if (ballStuck && !gameOver && !youWin)
-      {
-          drawTextScreen('Click or Space to Launch', vec2(mainCanvasSize.x/2, mainCanvasSize.y-70), 44, hsl(.14,.15,1), 6, hsl(0,0,0));
-      }
-
-      if (gameOver)
-      {
-          drawTextScreen('GAME OVER', vec2(mainCanvasSize.x/2, mainCanvasSize.y/2-10), 90, hsl(0,1,.7), 8, hsl(0,0,0));
-          drawTextScreen('Click / Space to Restart', vec2(mainCanvasSize.x/2, mainCanvasSize.y/2+70), 42, hsl(0,0,1), 6, hsl(0,0,0));
-      }
-      else if (youWin)
-      {
-          drawTextScreen('YOU WIN!', vec2(mainCanvasSize.x/2, mainCanvasSize.y/2-10), 90, hsl(.32,1,.65), 8, hsl(0,0,0));
-          drawTextScreen('Click / Space to Play Again', vec2(mainCanvasSize.x/2, mainCanvasSize.y/2+70), 42, hsl(0,0,1), 6, hsl(0,0,0));
-      }
-
-      // tiny controls hint
-      drawTextScreen('Move: Mouse or Arrow Keys / A-D', vec2(mainCanvasSize.x/2, 76), 22, hsl(0,0,1), 4, hsl(0,0,0));
-  }
-
-  ///////////////////////////////////////////////////////////////////////////////
-  // Startup LittleJS Engine
-  engineInit(gameInit, gameUpdate, gameUpdatePost, gameRender, gameRenderPost);
-
-  </script>
-</body>
+<!DOCTYPE html><head>
+<title>LittleJS AI Starter Project</title>
+<meta charset="utf-8">
+</head><body style="background:#000">
+<script src="https://cdn.jsdelivr.net/npm/littlejsengine@1.17.15/dist/littlejs.js"></script>
+<script>
+'use strict';
+
+// engine settings, do not remove
+debugWatermark = false; // Hide debug watermark in corner
+showEngineVersion = false; // Hide engine version console display
+paused = false; // Start unpaused
+
+// engine settings, customize if necessary
+gravity = vec2(0, 0); // No gravity by default
+cameraPos = vec2(0, 0); // Camera centered at origin
+cameraScale = 32; // Camera zoom, larger is more zoomed in
+
+// AI can use this class to make sound effects
+class SoundGenerator extends Sound 
+{
+    constructor(params = {})
+    {
+        const {
+            volume = 1,        // Volume scale (percent)
+            randomness = .05,  // How much to randomize frequency (percent Hz)
+            frequency = 220,   // Frequency of sound (Hz)
+            attack = 0,        // Attack time, how fast sound starts (seconds)
+            release = .1,      // Release time, how fast sound fades out (seconds)
+            shapeCurve = 1,    // Squarenes of wave (0=square, 1=normal, 2=pointy)
+            slide = 0,         // How much to slide frequency (kHz/s)
+            pitchJump = 0,     // Frequency of pitch jump (Hz)
+            pitchJumpTime = 0, // Time of pitch jump (seconds)
+            repeatTime = 0,    // Resets some parameters periodically (seconds)
+            noise = 0,         // How much random noise to add (percent)
+            bitCrush = 0,      // Resamples at a lower frequency in (samples*100)
+            delay = 0,         // Overlap sound with itself for reverb and flanger effects (seconds)
+        } = params;
+        
+        super([volume, randomness, frequency, attack, 0, release, 0, shapeCurve, slide, 0, pitchJump, pitchJumpTime, repeatTime, noise, 0, bitCrush, delay, 1, 0, 0, 0]);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Breakout + Predictable Special Powerup Bricks
+
+const levelSize = vec2(38, 20);
+
+let paddlePos, paddleSize;
+let paddleBaseSize;
+let paddleExtra = 0;
+
+let balls = [];            // {pos, vel, size, stuck, stuckOffsetX}
+let ballSpeed;
+
+let bricks = [];           // {pos,size,color,alive,special,dropType}
+let powerups = [];         // {pos, vel, size, type}
+let bullets = [];          // {pos, vel, size}
+
+let score = 0;
+let lives = 3;
+let state = 'serve'; // serve | play | win | lose
+
+// powerup timers
+let stickyTimer = 0;
+let laserTimer = 0;
+let laserCooldown = 0;
+
+// sounds
+let sfxBounce, sfxBrick, sfxLose, sfxWin, sfxPower, sfxLaser;
+
+const SPECIAL_BRICKS_PER_LEVEL = 8;    // only these can drop powerups
+const PADDLE_WIDEN_STEP = 1;           // "a little bit wider each time"
+const PADDLE_WIDEN_MAX = 12;           // max paddle width
+
+const STICKY_DURATION = 10;
+const LASER_DURATION = 10;
+
+function clampToLevelX(x, halfWidth)
+{
+    return clamp(x, halfWidth, levelSize.x - halfWidth);
+}
+
+function aabbOverlap(posA, sizeA, posB, sizeB)
+{
+    return abs(posA.x - posB.x) < (sizeA.x + sizeB.x) / 2 &&
+           abs(posA.y - posB.y) < (sizeA.y + sizeB.y) / 2;
+}
+
+// Resolve a ball (AABB) vs rect (AABB). Mutates ball pos/vel. Returns normal vec2 or 0.
+function resolveBallRect(ball, rectPos, rectSize)
+{
+    if (!aabbOverlap(ball.pos, vec2(ball.size), rectPos, rectSize))
+        return 0;
+
+    const halfB = ball.size / 2;
+    const dx = ball.pos.x - rectPos.x;
+    const dy = ball.pos.y - rectPos.y;
+    const px = (rectSize.x / 2 + halfB) - abs(dx);
+    const py = (rectSize.y / 2 + halfB) - abs(dy);
+
+    // push out along the smallest penetration axis
+    if (px < py)
+    {
+        const sx = sign(dx) || 1;
+        ball.pos.x += px * sx;
+        ball.vel.x = abs(ball.vel.x) * sx; // reflect x
+        return vec2(sx, 0);
+    }
+    else
+    {
+        const sy = sign(dy) || 1;
+        ball.pos.y += py * sy;
+        ball.vel.y = abs(ball.vel.y) * sy; // reflect y
+        return vec2(0, sy);
+    }
+}
+
+function applyPaddleWidth()
+{
+    const w = clamp(paddleBaseSize.x + paddleExtra, paddleBaseSize.x, PADDLE_WIDEN_MAX);
+    paddleSize = vec2(w, paddleBaseSize.y);
+}
+
+function resetPaddle()
+{
+    paddleBaseSize = vec2(6, .7);
+    paddleExtra = 0;
+    applyPaddleWidth();
+    paddlePos = vec2(levelSize.x / 2, 1.2);
+}
+
+function makeBall(pos, vel, size=.8)
+{
+    return { pos: pos.copy(), vel: vel.copy(), size, stuck:false, stuckOffsetX:0 };
+}
+
+function resetBall()
+{
+    balls.length = 0;
+    const size = .8;           // diameter
+    ballSpeed = 18;            // world units per second
+    const stuckPos = paddlePos.add(vec2(0, paddleSize.y/2 + size/2 + .2));
+    balls.push(makeBall(stuckPos, vec2(0,0), size));
+    state = 'serve';
+}
+
+function resetPowerups()
+{
+    powerups.length = 0;
+    bullets.length = 0;
+    stickyTimer = 0;
+    laserTimer = 0;
+    laserCooldown = 0;
+    // paddle width powerup is incremental & persistent for this life
+    applyPaddleWidth();
+}
+
+function resetGame()
+{
+    score = 0;
+    lives = 3;
+    state = 'serve';
+    resetPaddle();
+    resetBall();
+    resetBricks();
+    resetPowerups();
+}
+
+function launchBall()
+{
+    // 45..135 degrees upward
+    const angle = rand(.25, .75) * PI;
+    balls[0].vel = vec2(Math.cos(angle), Math.sin(angle)).normalize(ballSpeed);
+    state = 'play';
+}
+
+function playSound(s)
+{
+    try { s && s.play(); } catch(e) {}
+}
+
+function anyStuckBalls()
+{
+    for (const b of balls)
+        if (b.stuck) return true;
+    return false;
+}
+
+function releaseStuckBalls()
+{
+    let released = false;
+    for (const b of balls)
+    {
+        if (!b.stuck) continue;
+        b.stuck = false;
+
+        // release with a normal bounce angle based on offset
+        const offset = b.stuckOffsetX / (paddleSize.x / 2);
+        const x = clamp(offset, -1, 1);
+        b.vel = vec2(x * 1.2, 1).normalize(ballSpeed);
+        released = true;
+    }
+    return released;
+}
+
+function fireLaser()
+{
+    if (laserTimer <= 0)
+        return;
+    if (laserCooldown > 0)
+        return;
+
+    // spawn 2 shots from paddle edges
+    const y = paddlePos.y + paddleSize.y/2 + .25;
+    const x1 = paddlePos.x - paddleSize.x/2 + .35;
+    const x2 = paddlePos.x + paddleSize.x/2 - .35;
+    const v = vec2(0, 26);
+
+    bullets.push({ pos: vec2(x1, y), vel: v, size: vec2(.22, .7) });
+    bullets.push({ pos: vec2(x2, y), vel: v, size: vec2(.22, .7) });
+
+    laserCooldown = .14;
+    playSound(sfxLaser);
+}
+
+function resetBricks()
+{
+    bricks.length = 0;
+
+    // 9 rows of 2x1 bricks
+    const brickSize = vec2(2, 1);
+    for (let y = 12; y <= levelSize.y - 2; y += 1)
+    for (let x = 2;  x <= levelSize.x - 2; x += 2)
+    {
+        // color by row
+        const t = percent(y, 12, levelSize.y - 2);
+        const c = hsl(lerp(.55, .05, t), .9, .6);
+        bricks.push({ pos: vec2(x, y), size: brickSize, color: c, alive: true, special: false, dropType: '' });
+    }
+
+    // randomly select special bricks and ASSIGN what they drop so players can plan
+    const n = min(SPECIAL_BRICKS_PER_LEVEL, bricks.length);
+    const idx = [];
+    for (let i = 0; i < bricks.length; ++i) idx.push(i);
+
+    // fisher-yates shuffle
+    for (let i = idx.length - 1; i > 0; --i)
+    {
+        const j = (Math.random() * (i + 1)) | 0;
+        const t = idx[i]; idx[i] = idx[j]; idx[j] = t;
+    }
+
+    for (let k = 0; k < n; ++k)
+    {
+        const b = bricks[idx[k]];
+        b.special = true;
+
+        // Weighted drops: W common, M medium, T sticky less, L laser rare
+        const r = Math.random();
+        b.dropType = r < .45 ? 'W' : r < .75 ? 'M' : r < .92 ? 'T' : 'L';
+    }
+}
+
+function spawnPowerupFromBrick(brick)
+{
+    if (!brick.special || !brick.dropType)
+        return;
+
+    powerups.push({
+        pos: brick.pos.copy(),
+        vel: vec2(0, -7),
+        size: vec2(1.2, .8),
+        type: brick.dropType,
+    });
+}
+
+function applyPowerup(type)
+{
+    playSound(sfxPower);
+
+    if (type === 'W')
+    {
+        paddleExtra = min(paddleExtra + PADDLE_WIDEN_STEP, PADDLE_WIDEN_MAX - paddleBaseSize.x);
+        applyPaddleWidth();
+        return;
+    }
+
+    if (type === 'M')
+    {
+        if (!balls.length)
+            return;
+
+        // spawn 2 extra balls from the most recent ball
+        const src = balls[balls.length - 1];
+        const baseDir = src.vel.length() ? src.vel.normalize() : vec2(0, 1);
+        const a = baseDir.angle();
+        const d1 = vec2(Math.cos(a + .35), Math.sin(a + .35)).normalize(ballSpeed);
+        const d2 = vec2(Math.cos(a - .35), Math.sin(a - .35)).normalize(ballSpeed);
+
+        balls.push(makeBall(src.pos, d1, src.size));
+        balls.push(makeBall(src.pos, d2, src.size));
+        return;
+    }
+
+    if (type === 'T')
+    {
+        stickyTimer = STICKY_DURATION;
+        return;
+    }
+
+    if (type === 'L')
+    {
+        laserTimer = LASER_DURATION;
+        laserCooldown = 0;
+        return;
+    }
+}
+
+function powerupColor(type)
+{
+    return type === 'W' ? hsl(.58,.9,.6) :
+           type === 'M' ? hsl(.32,.9,.6) :
+           type === 'T' ? hsl(.12,.9,.62) :
+                          hsl(0,.9,.65);
+}
+
+function drawPowerLetter(pos, type, scale=1)
+{
+    // Use an actual letter so it's unambiguous (W/M/T/L)
+    // drawText(text, pos, size, color, lineWidth, lineColor, align)
+    // Keep outline very thin (or it blobs into a big dark shape).
+    const size = .8 * scale;
+    const lineWidth = .25; // hairline outline
+    drawText(type, pos, size, hsl(0,0,1), lineWidth, hsl(0,0,0), 'center');
+}
+
+///////////////////////////////////////////////////////////////////////////////
+async function gameInit()
+{
+    // fixed resolution (720p)
+    setCanvasFixedSize(vec2(1280, 720));
+
+    // camera for one-screen game
+    cameraPos = levelSize.scale(.5);
+
+    // simple sounds
+    sfxBounce = new SoundGenerator({ volume: .6, frequency: 400, release: .06, shapeCurve: 1.6 });
+    sfxBrick  = new SoundGenerator({ volume: .7, frequency: 620, release: .08, slide: -1.2, shapeCurve: 1.2 });
+    sfxLose   = new SoundGenerator({ volume: .8, frequency: 180, release: .25, slide: -1.0, noise: .1 });
+    sfxWin    = new SoundGenerator({ volume: .8, frequency: 520, release: .35, slide: .6, pitchJump: 220, pitchJumpTime: .08 });
+    sfxPower  = new SoundGenerator({ volume: .75, frequency: 740, release: .12, pitchJump: 260, pitchJumpTime: .03, shapeCurve: 1.1 });
+    sfxLaser  = new SoundGenerator({ volume: .55, frequency: 980, release: .06, slide: 1.5, shapeCurve: 1.8 });
+
+    resetGame();
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameUpdate()
+{
+    const dt = timeDelta;
+
+    // restart
+    if (keyWasPressed('KeyR'))
+        resetGame();
+
+    // paddle controls (keyboard takes priority if held)
+    const left  = keyIsDown('ArrowLeft') || keyIsDown('KeyA');
+    const right = keyIsDown('ArrowRight') || keyIsDown('KeyD');
+    const dir = (right ? 1 : 0) - (left ? 1 : 0);
+
+    if (dir)
+        paddlePos.x += dir * 24 * dt;
+    else
+        paddlePos.x = mousePos.x; // follow mouse
+
+    paddlePos.x = clampToLevelX(paddlePos.x, paddleSize.x / 2);
+
+    // timers
+    if (stickyTimer > 0) stickyTimer = max(0, stickyTimer - dt);
+    if (laserTimer  > 0) laserTimer  = max(0, laserTimer  - dt);
+    if (laserCooldown > 0) laserCooldown = max(0, laserCooldown - dt);
+
+    // serve keeps first ball stuck to paddle
+    if (state === 'serve')
+    {
+        const b = balls[0];
+        b.pos = paddlePos.add(vec2(0, paddleSize.y/2 + b.size/2 + .2));
+        if (mouseWasPressed(0) || keyWasPressed('Space') || keyWasPressed('Enter'))
+            launchBall();
+        return;
+    }
+
+    if (state === 'win' || state === 'lose')
+        return;
+
+    // input: release sticky first, otherwise laser fires
+    const actionPressed = mouseWasPressed(0) || keyWasPressed('Space') || keyWasPressed('Enter');
+    if (actionPressed && anyStuckBalls())
+        releaseStuckBalls();
+    else if (actionPressed)
+        fireLaser();
+
+    updatePowerups(dt);
+    updateBullets(dt);
+    updateBalls(dt);
+
+    // win check
+    let bricksLeft = 0;
+    for (const b of bricks)
+        if (b.alive) bricksLeft++;
+
+    if (bricksLeft === 0)
+    {
+        state = 'win';
+        playSound(sfxWin);
+    }
+}
+
+function updatePowerups(dt)
+{
+    for (let i = powerups.length; i--;)
+    {
+        const p = powerups[i];
+        p.pos = p.pos.add(p.vel.scale(dt));
+
+        if (p.pos.y < -2)
+        {
+            powerups.splice(i, 1);
+            continue;
+        }
+
+        if (aabbOverlap(p.pos, p.size, paddlePos, paddleSize))
+        {
+            applyPowerup(p.type);
+            powerups.splice(i, 1);
+        }
+    }
+}
+
+function updateBullets(dt)
+{
+    for (let i = bullets.length; i--;)
+    {
+        const s = bullets[i];
+        s.pos = s.pos.add(s.vel.scale(dt));
+
+        // off screen
+        if (s.pos.y > levelSize.y + 2)
+        {
+            bullets.splice(i, 1);
+            continue;
+        }
+
+        // hit a brick
+        let hit = false;
+        for (const b of bricks)
+        {
+            if (!b.alive) continue;
+            if (!aabbOverlap(s.pos, s.size, b.pos, b.size))
+                continue;
+
+            b.alive = false;
+            score += 100;
+            playSound(sfxBrick);
+            spawnPowerupFromBrick(b);
+            hit = true;
+            break;
+        }
+
+        if (hit)
+            bullets.splice(i, 1);
+    }
+}
+
+function updateBalls(dt)
+{
+    // move & collide each ball
+    for (const ball of balls)
+    {
+        // stuck balls follow paddle
+        if (ball.stuck)
+        {
+            ball.pos.x = clampToLevelX(paddlePos.x + ball.stuckOffsetX, ball.size/2);
+            ball.pos.y = paddlePos.y + paddleSize.y/2 + ball.size/2 + .001;
+            continue;
+        }
+
+        ball.pos = ball.pos.add(ball.vel.scale(dt));
+
+        const r = ball.size / 2;
+
+        // wall collisions
+        if (ball.pos.x - r < 0)
+        {
+            ball.pos.x = r;
+            ball.vel.x = abs(ball.vel.x);
+            playSound(sfxBounce);
+        }
+        else if (ball.pos.x + r > levelSize.x)
+        {
+            ball.pos.x = levelSize.x - r;
+            ball.vel.x = -abs(ball.vel.x);
+            playSound(sfxBounce);
+        }
+
+        if (ball.pos.y + r > levelSize.y)
+        {
+            ball.pos.y = levelSize.y - r;
+            ball.vel.y = -abs(ball.vel.y);
+            playSound(sfxBounce);
+        }
+
+        // paddle collision (only if moving downward)
+        if (ball.vel.y < 0 && aabbOverlap(ball.pos, vec2(ball.size), paddlePos, paddleSize))
+        {
+            // sticky overrides normal bounce
+            if (stickyTimer > 0)
+            {
+                ball.stuck = true;
+                ball.stuckOffsetX = clamp(ball.pos.x - paddlePos.x, -paddleSize.x/2 + r, paddleSize.x/2 - r);
+                ball.vel = vec2(0, 0);
+                ball.pos.y = paddlePos.y + paddleSize.y/2 + r + .001;
+                playSound(sfxBounce);
+            }
+            else
+            {
+                ball.pos.y = paddlePos.y + paddleSize.y/2 + r + .001;
+
+                // reflect with angle based on hit offset
+                const offset = (ball.pos.x - paddlePos.x) / (paddleSize.x / 2);
+                const x = clamp(offset, -1, 1);
+                ball.vel = vec2(x * 1.2, 1).normalize(ballSpeed);
+                playSound(sfxBounce);
+            }
+        }
+
+        // brick collisions (hit one per frame per ball)
+        for (const b of bricks)
+        {
+            if (!b.alive) continue;
+            if (!aabbOverlap(ball.pos, vec2(ball.size), b.pos, b.size))
+                continue;
+
+            resolveBallRect(ball, b.pos, b.size);
+            b.alive = false;
+            score += 100;
+            playSound(sfxBrick);
+
+            spawnPowerupFromBrick(b);
+
+            // keep speed consistent
+            ball.vel = ball.vel.normalize(ballSpeed);
+            break;
+        }
+    }
+
+    // remove balls that fell out
+    for (let i = balls.length; i--;)
+    {
+        const ball = balls[i];
+        if (!ball.stuck && ball.pos.y + ball.size/2 < 0)
+            balls.splice(i, 1);
+    }
+
+    // if all balls gone, lose a life and serve again
+    if (!balls.length)
+    {
+        lives--;
+        playSound(sfxLose);
+        if (lives <= 0)
+            state = 'lose';
+        else
+        {
+            // losing a life resets paddle + temporary powers
+            paddleExtra = 0;
+            applyPaddleWidth();
+            stickyTimer = 0;
+            laserTimer = 0;
+            bullets.length = 0;
+
+            // clear any falling powerups for a clean re-serve
+            powerups.length = 0;
+
+            resetBall();
+        }
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameUpdatePost()
+{
+    // keep camera locked to level
+    cameraPos = levelSize.scale(.5);
+
+    // fit level to canvas nicely
+    const fit = min(mainCanvasSize.x / levelSize.x, mainCanvasSize.y / levelSize.y);
+    cameraScale = fit * .95;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameRender()
+{
+    // background
+    drawRect(cameraPos, levelSize.scale(3), rgb(.05,.05,.07));
+    drawRect(cameraPos, levelSize, rgb(.08,.08,.11));
+
+    // bricks
+    for (const b of bricks)
+    {
+        if (!b.alive) continue;
+
+        if (b.special)
+        {
+            // special bricks: bright frame + drop-type icon so player can plan
+            const frame = powerupColor(b.dropType);
+            drawRect(b.pos, b.size.subtract(vec2(.02,.02)), frame);
+            drawRect(b.pos, b.size.subtract(vec2(.18,.18)), b.color);
+            drawPowerLetter(b.pos, b.dropType, 1);
+        }
+        else
+        {
+            drawRect(b.pos, b.size.subtract(vec2(.08,.08)), b.color);
+        }
+    }
+
+    // powerups
+    for (const p of powerups)
+    {
+        drawRect(p.pos, p.size, powerupColor(p.type));
+        drawPowerLetter(p.pos, p.type, 1);
+    }
+
+    // bullets
+    for (const s of bullets)
+        drawRect(s.pos, s.size, hsl(0,0,1));
+
+    // paddle
+    const paddleCol = stickyTimer > 0 ? hsl(.12,.75,.75) : laserTimer > 0 ? hsl(0,.75,.72) : hsl(0,0,.95);
+    drawRect(paddlePos, paddleSize, paddleCol);
+
+    // balls
+    for (const b of balls)
+        drawCircle(b.pos, b.size, hsl(.12, .9, .6));
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameRenderPost()
+{
+    // HUD
+    drawTextScreen(`Score ${score}`, vec2(16, 16), 28, hsl(0,0,1), 4, hsl(0,0,0), 'left');
+    drawTextScreen(`Lives ${lives}`, vec2(mainCanvasSize.x - 16, 16), 28, hsl(0,0,1), 4, hsl(0,0,0), 'right');
+
+    // powerup status
+    let status = '';
+    if (paddleExtra > 0) status += `WIDE +${paddleExtra.toFixed(0)}   `;
+    if (stickyTimer > 0) status += `STICKY ${stickyTimer.toFixed(0)}s   `;
+    if (laserTimer  > 0) status += `LASER ${laserTimer.toFixed(0)}s   `;
+    if (balls.length > 1) status += `BALLS ${balls.length}`;
+    if (status)
+        drawTextScreen(status, vec2(mainCanvasSize.x/2, 16), 22, hsl(0,0,.95), 4, hsl(0,0,0));
+
+    if (state === 'serve')
+    {
+        drawTextScreen(`Click or Space to launch`, vec2(mainCanvasSize.x/2, mainCanvasSize.y - 70), 36,
+            hsl(0,0,1), 6, hsl(0,0,0));
+        drawTextScreen(`Move: Mouse or A/D · Restart: R`, vec2(mainCanvasSize.x/2, mainCanvasSize.y - 32), 22,
+            hsl(0,0,.9), 4, hsl(0,0,0));
+    }
+    else if (state === 'win')
+    {
+        drawTextScreen(`YOU WIN!`, vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 + 20), 90,
+            hsl(.32,.8,.6), 10, hsl(0,0,0));
+        drawTextScreen(`Press R to play again`, vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 - 50), 32,
+            hsl(0,0,1), 6, hsl(0,0,0));
+    }
+    else if (state === 'lose')
+    {
+        drawTextScreen(`GAME OVER`, vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 + 20), 90,
+            hsl(0,1,.6), 10, hsl(0,0,0));
+        drawTextScreen(`Press R to try again`, vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 - 50), 32,
+            hsl(0,0,1), 6, hsl(0,0,0));
+    }
+
+    // hint
+    const hint = `Special bricks show their drop (W=Wide, M=Multi, T=Sticky, L=Laser)`;
+    drawTextScreen(hint, vec2(mainCanvasSize.x/2, mainCanvasSize.y - 18), 18,
+        hsl(0,0,.8), 4, hsl(0,0,0));
+
+    // laser usage hint
+    if (laserTimer > 0)
+        drawTextScreen(`Laser: Click/Space to shoot`, vec2(mainCanvasSize.x/2, mainCanvasSize.y - 40), 18,
+            hsl(0,0,.9), 4, hsl(0,0,0));
+
+    // sticky usage hint
+    if (stickyTimer > 0)
+        drawTextScreen(`Sticky: balls stick to paddle · Click/Space to release`, vec2(mainCanvasSize.x/2, mainCanvasSize.y - 58), 18,
+            hsl(0,0,.9), 4, hsl(0,0,0));
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Startup LittleJS Engine
+engineInit(gameInit, gameUpdate, gameUpdatePost, gameRender, gameRenderPost);
+
+</script>

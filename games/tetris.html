@@ -1,8 +1,9 @@
 <!DOCTYPE html><head>
 <title>LittleJS AI Starter Project</title>
-<meta charset=utf-8>
+<meta charset="utf-8">
 </head><body style="background:#000">
 <script src="https://cdn.jsdelivr.net/npm/littlejsengine@1.17.15/dist/littlejs.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/littlejsengine@1.17.15/dist/box2d.wasm.js"></script>
 <script>
 'use strict';
 
@@ -12,865 +13,367 @@ showEngineVersion = false; // Hide engine version console display
 paused = false; // Start unpaused
 
 // engine settings, customize if necessary
-gravity = vec2(0, 0); // No gravity by default
-cameraPos = vec2(0, 0); // Camera centered at origin
-cameraScale = 32; // Camera zoom, larger is more zoomed in
+gravity = vec2(0, 0);
+objectDefaultDamping = .01;
+objectDefaultAngleDamping = .01;
+cameraScale = 28;
+canvasClearColor = hsl(0,0,.08); // set immediately so we don't flash white while loading
+cameraPos = vec2();
 
-// AI can use this class to make sound effects
-class SoundGenerator extends Sound 
+///////////////////////////////////////////////////////////////////////////////
+// Pinball (Box2D) - tiny prototype
+//
+// Fix for "Assert failed!": LittleJS Box2D helpers use `addCircle(diameter, ... isSensor)`
+// where the last parameter MUST be a boolean. The earlier code accidentally passed a
+// number as isSensor (e.g. 0.4), which triggers LittleJS ASSERT.
+//
+// Note: We use LittleJS's built-in Sound class for SFX so we don't depend on any
+// optional helper like SoundGenerator.
+
+const FIELD_W = 16;
+const FIELD_H = 28;
+const FIELD_BOTTOM = -FIELD_H/2;
+const FIELD_TOP    =  FIELD_H/2;
+
+let table;                 // Box2dStaticObject holding walls
+let ball;                  // Box2dObject
+let score = 0;
+let ballsLeft = 3;
+
+let leftFlipper, rightFlipper;
+let leftJoint, rightJoint;
+
+let launchCharge = 0;
+let canLaunch = false;
+
+// simple sfx (LittleJS Sound)
+let sfxBumper, sfxFlip, sfxDrain;
+
+let ready = false;
+let initError = '';
+
+class Bumper extends Box2dStaticObject
 {
-    constructor(params = {})
+    // radius is in world units; addCircle expects diameter
+    constructor(pos, radius=1.1)
     {
-        const {
-            volume = 1,        // Volume scale (percent)
-            randomness = .05,  // How much to randomize frequency (percent Hz)
-            frequency = 220,   // Frequency of sound (Hz)
-            attack = 0,        // Attack time, how fast sound starts (seconds)
-            release = .1,      // Release time, how fast sound fades out (seconds)
-            shapeCurve = 1,    // Squarenes of wave (0=square, 1=normal, 2=pointy)
-            slide = 0,         // How much to slide frequency (kHz/s)
-            pitchJump = 0,     // Frequency of pitch jump (Hz)
-            pitchJumpTime = 0, // Time of pitch jump (seconds)
-            repeatTime = 0,    // Resets some parameters periodically (seconds)
-            noise = 0,         // How much random noise to add (percent)
-            bitCrush = 0,      // Resamples at a lower frequency in (samples*100)
-            delay = 0,         // Overlap sound with itself for reverb and flanger effects (seconds)
-        } = params;
-        
-        super([volume, randomness, frequency, attack, 0, release, 0, shapeCurve, slide, 0, pitchJump, pitchJumpTime, repeatTime, noise, 0, bitCrush, delay, 1, 0, 0, 0]);
+        super(pos);
+        this.color = hsl(.12, .8, .55);
+        this.lineColor = hsl(0,0,0);
+        this.lineWidth = .15;
+
+        const diameter = radius * 2;
+        // addCircle(diameter, offset, density, friction, restitution, isSensor)
+        // For static objects, density is ignored, but we keep it 0.
+        this.addCircle(diameter, vec2(), 0, .2, .95, false);
+    }
+
+    beginContact(other)
+    {
+        if (other != ball) return;
+
+        score += 100;
+
+        // kick the ball away from the bumper center
+        const dir = ball.pos.subtract(this.pos);
+        const n = dir.length() ? dir.normalize() : vec2(0,1);
+        ball.applyAcceleration(n.scale(25)); // impulse-ish
+
+        sfxBumper && sfxBumper.play(ball.pos);
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// TETRIS
-////////////////////////////////////////////////////////////////////////////////
-
-// board
-const BOARD_W = 10;
-const BOARD_H = 20;
-
-// layout in world space
-const boardOrigin = vec2(-9, -10);                     // bottom-left corner of board
-const boardCenter = boardOrigin.add(vec2(BOARD_W/2, BOARD_H/2));
-const panelX = 6.2;
-
-// timing
-const SOFT_DROP_INTERVAL = 0.035;
-const LOCK_DELAY = 0.45;
-const DAS = 0.16;   // delayed auto shift
-const ARR = 0.05;   // auto repeat rate
-
-// scoring
-const SCORE_TABLE = [0, 100, 300, 500, 800];
-
-// piece definitions (4x4 local coords)
-const PIECE_NAMES = ['I','J','L','O','S','T','Z'];
-const PIECE_BASE = [
-    [vec2(0,1), vec2(1,1), vec2(2,1), vec2(3,1)], // I
-    [vec2(0,2), vec2(0,1), vec2(1,1), vec2(2,1)], // J
-    [vec2(2,2), vec2(0,1), vec2(1,1), vec2(2,1)], // L
-    [vec2(1,2), vec2(2,2), vec2(1,1), vec2(2,1)], // O
-    [vec2(1,2), vec2(2,2), vec2(0,1), vec2(1,1)], // S
-    [vec2(1,2), vec2(0,1), vec2(1,1), vec2(2,1)], // T
-    [vec2(0,2), vec2(1,2), vec2(1,1), vec2(2,1)], // Z
-];
-
-const PIECE_COLORS = [
-    hsl(.55, 1, .62), // I
-    hsl(.63, 1, .62), // J
-    hsl(.10, 1, .60), // L
-    hsl(.15, 1, .62), // O
-    hsl(.33, 1, .58), // S
-    hsl(.83, 1, .62), // T
-    hsl(.00, 1, .62), // Z
-];
-
-function rotateCWCoord(p) { return vec2(3 - p.y, p.x); }
-function rotateCCWCoord(p){ return vec2(p.y, 3 - p.x); }
-
-function genRotations(base)
+class Flipper extends Box2dObject
 {
-    const rots = [];
-    let coords = base.map(p=>p.copy());
-    for (let i=0; i<4; ++i)
+    constructor(pos, angle, isRight=false)
     {
-        rots.push(coords.map(p=>p.copy()));
-        coords = coords.map(rotateCWCoord);
-    }
-    return rots;
-}
+        super(pos, vec2(), 0, angle, hsl(isRight?.55:.05, .7, .55));
+        this.lineColor = hsl(0,0,0);
+        this.lineWidth = .12;
 
-const PIECE_ROTS = PIECE_BASE.map(genRotations);
-
-////////////////////////////////////////////////////////////////////////////////
-// FX: particles, flashes, shake
-////////////////////////////////////////////////////////////////////////////////
-
-const particles = [];
-const lineFlashes = []; // {y, t}
-
-let shakeTime = 0;
-let shakeStrength = 0;
-let landPulse = 0; // little squash pulse when locking
-
-function addShake(strength, duration)
-{
-    shakeStrength = max(shakeStrength, strength);
-    shakeTime = max(shakeTime, duration);
-}
-
-function spawnParticles(worldPos, baseColor, count, speed, size, life, upwardBias=0)
-{
-    for (let i=0; i<count; ++i)
-    {
-        const a = rand(2*PI);
-        const r = speed * (0.35 + rand() * 0.65);
-        let v = vec2(Math.cos(a), Math.sin(a)).scale(r);
-        v.y += upwardBias;
-
-        const c = baseColor.copy();
-        c.a = 1;
-
-        particles.push({
-            p: worldPos.copy(),
-            v,
-            s: size * (0.55 + rand() * 0.9),
-            t: life * (0.55 + rand() * 0.9),
-            t0: life,
-            c,
-            spin: (randSign() * (2 + rand()*6)),
-            ang: rand(2*PI),
-        });
+        // addBox(size, offset, angle, density, friction, restitution, isSensor)
+        this.addBox(vec2(4.2, .75), vec2(), 0, 3, .4, .1, false);
+        this.setAngularDamping(8);
+        this.setDamping(1);
+        this.setBullet(true);
     }
 }
 
-function spawnImpactForBlocks(blocks, type, strength=1)
+function makeWalls()
 {
-    const c = PIECE_COLORS[type];
-    for (const b of blocks)
-    {
-        if (b.y < 0 || b.y >= BOARD_H) continue;
-        const wp = boardOrigin.add(vec2(b.x + .5, b.y + .5));
-        spawnParticles(wp, c, 4*strength|0, 6 + 4*strength, 0.13, 0.35, 3);
-    }
+    table = new Box2dStaticObject(vec2());
+    table.color = hsl(0,0,.15);
+    table.lineColor = hsl(0,0,0);
+    table.lineWidth = .15;
+
+    // outer walls
+    table.addBox(vec2(1, FIELD_H+2), vec2(-FIELD_W/2 - .5, 0), 0, 0, .2, .2, false);
+    table.addBox(vec2(1, FIELD_H+2), vec2( FIELD_W/2 + .5, 0), 0, 0, .2, .2, false);
+    table.addBox(vec2(FIELD_W+2, 1), vec2(0, FIELD_TOP + .5), 0, 0, .2, .2, false);
+
+    // shooter lane wall (right)
+    table.addBox(vec2(1, FIELD_H*0.65), vec2(5.8, FIELD_BOTTOM + FIELD_H*0.325), 0, 0, .2, .2, false);
+
+    // bottom sloped guides to flippers
+    table.addBox(vec2(6.5, 1), vec2(-4.0, FIELD_BOTTOM + 2.3),  0.30, 0, .2, .2, false);
+    table.addBox(vec2(6.5, 1), vec2( 4.0, FIELD_BOTTOM + 2.3), -0.30, 0, .2, .2, false);
+
+    // little posts near drain
+    table.addBox(vec2(.6, 1.8), vec2(-1.8, FIELD_BOTTOM + 1.2), 0, 0, .2, .2, false);
+    table.addBox(vec2(.6, 1.8), vec2( 1.8, FIELD_BOTTOM + 1.2), 0, 0, .2, .2, false);
+
+    // top angled nudges
+    table.addBox(vec2(6, 1), vec2(-4.5, FIELD_TOP-2.5), -0.35, 0, .2, .2, false);
+    table.addBox(vec2(6, 1), vec2( 4.5, FIELD_TOP-2.5),  0.35, 0, .2, .2, false);
 }
 
-function spawnLineClearFX(rowsCleared)
+function makeFlippers()
 {
-    for (const y of rowsCleared)
-    {
-        lineFlashes.push({y, t: 0.22});
+    // left flipper pivots near left wall, points toward center
+    const leftPivot  = vec2(-5.4, FIELD_BOTTOM + 2.2);
+    const leftCenter = leftPivot.add(vec2(2.1, .15));
+    leftFlipper = new Flipper(leftCenter, 0.20, false);
 
-        // burst across the row
-        for (let x=0; x<BOARD_W; ++x)
-        {
-            const type = board[y][x];
-            const c = (type === -1 ? hsl(0,0,1) : PIECE_COLORS[type]);
-            const wp = boardOrigin.add(vec2(x + .5, y + .5));
-            spawnParticles(wp, c, 5, 10, 0.12, 0.42, 5);
-        }
-    }
+    leftJoint = new Box2dRevoluteJoint(table, leftFlipper, leftPivot);
+    leftJoint.enableLimit(true);
+    leftJoint.setLimits(-0.95, 0.25);
+    leftJoint.enableMotor(true);
+    leftJoint.setMaxMotorTorque(2200);
 
-    addShake(0.5 + 0.3*rowsCleared.length, 0.22);
+    // right flipper pivots near right wall, points toward center (angle ~ PI)
+    const rightPivot  = vec2(5.4, FIELD_BOTTOM + 2.2);
+    const rightCenter = rightPivot.add(vec2(-2.1, .15));
+    rightFlipper = new Flipper(rightCenter, PI-0.20, true);
+
+    rightJoint = new Box2dRevoluteJoint(table, rightFlipper, rightPivot);
+    rightJoint.enableLimit(true);
+    rightJoint.setLimits(PI-0.25, PI+0.95); // down near PI+0.95, up near PI-0.25
+    rightJoint.enableMotor(true);
+    rightJoint.setMaxMotorTorque(2200);
 }
 
-function updateFX()
+function spawnBall(isNewBall=false)
 {
-    // particles
-    for (let i=particles.length-1; i>=0; --i)
-    {
-        const pt = particles[i];
-        pt.t -= timeDelta;
-        if (pt.t <= 0)
-        {
-            particles.splice(i, 1);
-            continue;
-        }
+    if (ball) ball.destroy();
 
-        // integrate
-        pt.p = pt.p.add(pt.v.scale(timeDelta));
+    if (isNewBall)
+        ballsLeft = max(0, ballsLeft-1);
 
-        // little gravity downward
-        pt.v = pt.v.add(vec2(0, -20).scale(timeDelta));
+    // start in shooter lane
+    const startPos = vec2(6.9, FIELD_BOTTOM + 1.6);
+    ball = new Box2dObject(startPos, vec2(), 0, 0, WHITE);
+    ball.lineColor = hsl(0,0,0);
+    ball.lineWidth = .12;
 
-        // drag
-        pt.v = pt.v.scale(1 - min(1, 2.2*timeDelta));
+    // addCircle expects DIAMETER (not radius) and the last param isSensor must be boolean
+    ball.addCircle(1.1, vec2(), 1.0, .05, .35, false);
 
-        // spin
-        pt.ang += pt.spin * timeDelta;
-    }
-
-    // flashes
-    for (let i=lineFlashes.length-1; i>=0; --i)
-    {
-        lineFlashes[i].t -= timeDelta;
-        if (lineFlashes[i].t <= 0)
-            lineFlashes.splice(i, 1);
-    }
-
-    // shake
-    if (shakeTime > 0)
-    {
-        shakeTime -= timeDelta;
-        if (shakeTime <= 0)
-        {
-            shakeTime = 0;
-            shakeStrength = 0;
-        }
-        else
-            shakeStrength = max(0, shakeStrength - 2.2*timeDelta);
-    }
-
-    // landing pulse
-    landPulse = max(0, landPulse - 3.5*timeDelta);
+    ball.setBullet(true);
+    ball.setAngularDamping(.2);
+    ball.setDamping(.05);
+    ball.setGravityScale(1);
 }
 
-function renderFXWorld()
+function ballIsInShooterLane()
 {
-    // flashes on cleared lines
-    for (const f of lineFlashes)
-    {
-        const alpha = clamp(f.t / 0.22, 0, 1);
-        const y = f.y;
-        const p = boardOrigin.add(vec2(BOARD_W/2, y + .5));
-        const c = hsl(0,0,1);
-        c.a = 0.55 * alpha;
-        drawRect(p, vec2(BOARD_W, 1), c);
-    }
-
-    // particles
-    for (const pt of particles)
-    {
-        const a = clamp(pt.t / pt.t0, 0, 1);
-        const c = pt.c.copy();
-        c.a = a;
-
-        // shrink as it fades
-        const s = pt.s * (0.55 + 0.45*a);
-
-        // simple "diamond" spark
-        const dir = vec2(Math.cos(pt.ang), Math.sin(pt.ang));
-        drawLine(pt.p.add(dir.scale(s*1.2)), pt.p.add(dir.scale(-s*1.2)), s*0.6, c);
-        drawLine(pt.p.add(vec2(-dir.y, dir.x).scale(s*1.2)), pt.p.add(vec2(-dir.y, dir.x).scale(-s*1.2)), s*0.6, c);
-
-        // tiny core
-        drawRect(pt.p, vec2(s*0.6), c.scale(.9));
-    }
+    return ball && ball.pos.x > 6 && ball.pos.y < FIELD_BOTTOM + 4;
 }
 
-// state
-let board;
-let active;
-let nextType;
-let holdType;
-let holdUsed;
-let bag;
-
-let fallTimer;
-let lockTimer;
-let score;
-let lines;
-let level;
-let gameOver;
-
-// input repeat
-let leftNextRepeat = 0;
-let rightNextRepeat = 0;
-
-// sounds
-let sMove, sRotate, sLock, sLine, sTetris, sHold, sOver;
-
-function makeSounds()
+function ballIsDrained()
 {
-    sMove   = new SoundGenerator({volume:.35, frequency:420, attack:0, release:.06, shapeCurve:1.2});
-    sRotate = new SoundGenerator({volume:.40, frequency:620, attack:0, release:.08, shapeCurve:.9});
-    sLock   = new SoundGenerator({volume:.45, frequency:140, attack:0, release:.10, shapeCurve:1.6, noise:.1});
-    sLine   = new SoundGenerator({volume:.60, frequency:520, attack:0, release:.16, shapeCurve:1.0, slide:-.4});
-    sTetris = new SoundGenerator({volume:.75, frequency:420, attack:0, release:.30, shapeCurve:.7, slide:.6});
-    sHold   = new SoundGenerator({volume:.40, frequency:300, attack:0, release:.10, shapeCurve:1.1});
-    sOver   = new SoundGenerator({volume:.70, frequency:110, attack:0, release:.50, shapeCurve:1.9, slide:-.6, noise:.2});
+    return ball && ball.pos.y < FIELD_BOTTOM - 3;
 }
-
-function emptyBoard()
-{
-    board = [];
-    for (let y=0; y<BOARD_H; ++y)
-        board.push(new Array(BOARD_W).fill(-1));
-}
-
-function shuffle(array)
-{
-    for (let i=array.length-1; i>0; --i)
-    {
-        const j = randInt(i+1);
-        const t = array[i];
-        array[i] = array[j];
-        array[j] = t;
-    }
-}
-
-function refillBag()
-{
-    bag = [0,1,2,3,4,5,6];
-    shuffle(bag);
-}
-
-function popBag()
-{
-    if (!bag || !bag.length)
-        refillBag();
-    return bag.pop();
-}
-
-function levelFallInterval()
-{
-    // simple curve
-    return max(0.10, 0.80 - (level-1) * 0.055);
-}
-
-function spawnPiece(type)
-{
-    active = {
-        type,
-        rot: 0,
-        pos: vec2(3, BOARD_H - 4), // fits inside 0..19
-    };
-    fallTimer = 0;
-    lockTimer = 0;
-
-    // game over if the spawn collides
-    if (collides(active.pos, active.rot, active.type))
-    {
-        gameOver = true;
-        sOver && sOver.play();
-
-        // explode from top
-        const wp = boardOrigin.add(vec2(BOARD_W/2, BOARD_H - 2));
-        spawnParticles(wp, hsl(0,0,1), 160, 12, 0.14, 0.65, 10);
-        addShake(1.2, 0.5);
-    }
-}
-
-function restartGame()
-{
-    emptyBoard();
-    refillBag();
-    holdType = -1;
-    holdUsed = false;
-    score = 0;
-    lines = 0;
-    level = 1;
-    gameOver = false;
-
-    // clear fx
-    particles.length = 0;
-    lineFlashes.length = 0;
-    shakeTime = 0;
-    shakeStrength = 0;
-    landPulse = 0;
-
-    nextType = popBag();
-    spawnPiece(popBag());
-}
-
-function getBlocks(pos, rot, type)
-{
-    const coords = PIECE_ROTS[type][mod(rot,4)];
-    return coords.map(p=>vec2(pos.x + p.x, pos.y + p.y));
-}
-
-function collides(pos, rot, type)
-{
-    const blocks = getBlocks(pos, rot, type);
-    for (const b of blocks)
-    {
-        if (b.x < 0 || b.x >= BOARD_W) return true;
-        if (b.y < 0) return true;
-        if (b.y >= BOARD_H) continue; // allow above top
-        if (board[b.y][b.x] !== -1) return true;
-    }
-    return false;
-}
-
-function tryMove(dx, dy)
-{
-    const newPos = vec2(active.pos.x + dx, active.pos.y + dy);
-    if (!collides(newPos, active.rot, active.type))
-    {
-        active.pos = newPos;
-        if (dx)
-        {
-            sMove && sMove.play();
-
-            // tiny trail
-            const blocks = getBlocks(active.pos, active.rot, active.type);
-            const c = PIECE_COLORS[active.type];
-            for (const b of blocks)
-            {
-                if (b.y < 0 || b.y >= BOARD_H) continue;
-                const wp = boardOrigin.add(vec2(b.x + .5 - dx*0.35, b.y + .5));
-                spawnParticles(wp, c, 1, 4, 0.10, 0.20, 1);
-            }
-        }
-        lockTimer = 0;
-        return true;
-    }
-    return false;
-}
-
-function tryRotate(dir) // dir=+1 cw, -1 ccw
-{
-    const newRot = mod(active.rot + (dir>0?1:3), 4);
-
-    // simple kick table
-    const kicks = [
-        vec2(0,0), vec2(1,0), vec2(-1,0), vec2(0,1), vec2(0,-1),
-        vec2(2,0), vec2(-2,0)
-    ];
-
-    for (const k of kicks)
-    {
-        const newPos = active.pos.add(k);
-        if (!collides(newPos, newRot, active.type))
-        {
-            active.rot = newRot;
-            active.pos = newPos;
-            sRotate && sRotate.play();
-
-            // spin sparks around the piece center
-            const center = boardOrigin.add(vec2(active.pos.x + 2, active.pos.y + 2));
-            spawnParticles(center, PIECE_COLORS[active.type], 14, 8, 0.12, 0.28, 3);
-
-            lockTimer = 0;
-            return true;
-        }
-    }
-
-    return false;
-}
-
-function isResting()
-{
-    return collides(vec2(active.pos.x, active.pos.y - 1), active.rot, active.type);
-}
-
-function hardDrop()
-{
-    let d = 0;
-    while (!collides(vec2(active.pos.x, active.pos.y - 1), active.rot, active.type))
-    {
-        active.pos.y -= 1;
-        d++;
-
-        // streak spark occasionally
-        if ((d & 1) === 0)
-        {
-            const c = PIECE_COLORS[active.type];
-            const blocks = getBlocks(active.pos, active.rot, active.type);
-            for (const b of blocks)
-            {
-                if (b.y < 0 || b.y >= BOARD_H) continue;
-                const wp = boardOrigin.add(vec2(b.x + .5, b.y + .5 + .5));
-                spawnParticles(wp, c, 1, 5, 0.10, 0.18, 2);
-            }
-        }
-    }
-    if (d) score += d * 2;
-
-    // stronger impact shake
-    addShake(0.45 + d*0.01, 0.14);
-
-    lockPiece(true);
-}
-
-function holdPiece()
-{
-    if (holdUsed) return;
-    holdUsed = true;
-    sHold && sHold.play();
-
-    // puff
-    const center = boardOrigin.add(vec2(active.pos.x + 2, active.pos.y + 2));
-    spawnParticles(center, PIECE_COLORS[active.type], 22, 9, 0.13, 0.32, 5);
-
-    const currentType = active.type;
-    if (holdType === -1)
-    {
-        holdType = currentType;
-        spawnPiece(nextType);
-        nextType = popBag();
-    }
-    else
-    {
-        active.type = holdType;
-        holdType = currentType;
-        active.rot = 0;
-        active.pos = vec2(3, BOARD_H - 4);
-        fallTimer = 0;
-        lockTimer = 0;
-
-        if (collides(active.pos, active.rot, active.type))
-        {
-            gameOver = true;
-            sOver && sOver.play();
-        }
-    }
-}
-
-function lockPiece(fromHardDrop=false)
-{
-    const blocks = getBlocks(active.pos, active.rot, active.type);
-    for (const b of blocks)
-    {
-        if (b.y >= BOARD_H)
-        {
-            gameOver = true;
-            sOver && sOver.play();
-            return;
-        }
-        board[b.y][b.x] = active.type;
-    }
-
-    // impact FX
-    spawnImpactForBlocks(blocks, active.type, fromHardDrop ? 2 : 1);
-    landPulse = 1;
-    addShake(fromHardDrop ? 0.35 : 0.18, fromHardDrop ? 0.14 : 0.10);
-
-    sLock && !fromHardDrop && sLock.play();
-
-    // clear lines
-    let cleared = 0;
-    const clearedRows = [];
-    for (let y=0; y<BOARD_H; ++y)
-    {
-        let full = true;
-        for (let x=0; x<BOARD_W; ++x)
-            if (board[y][x] === -1) { full = false; break; }
-
-        if (full)
-        {
-            cleared++;
-            clearedRows.push(y);
-            for (let yy=y; yy<BOARD_H-1; ++yy)
-                board[yy] = board[yy+1];
-            board[BOARD_H-1] = new Array(BOARD_W).fill(-1);
-            y--; // recheck this row index
-        }
-    }
-
-    if (cleared)
-    {
-        lines += cleared;
-        level = 1 + (lines/10|0);
-        score += SCORE_TABLE[cleared] * level;
-        (cleared === 4 ? sTetris : sLine)?.play();
-
-        spawnLineClearFX(clearedRows);
-    }
-
-    // next
-    holdUsed = false;
-    spawnPiece(nextType);
-    nextType = popBag();
-}
-
-function ghostY()
-{
-    let y = active.pos.y;
-    while (!collides(vec2(active.pos.x, y-1), active.rot, active.type))
-        y--;
-    return y;
-}
-
-function drawCell(x, y, color, scale=1)
-{
-    const p = boardOrigin.add(vec2(x + .5, y + .5));
-    const s = vec2(.98*scale);
-    drawRect(p, s, color);
-    // subtle inner
-    drawRect(p, s.scale(.80), color.scale(.88));
-
-    // little highlight line
-    drawLine(p.add(vec2(-.35*scale, .35*scale)), p.add(vec2(.35*scale, .35*scale)), .06*scale, color.scale(1.2));
-}
-
-function drawPieceAt(type, rot, pos, alpha=1, scale=1)
-{
-    const blocks = getBlocks(pos, rot, type);
-    const c = PIECE_COLORS[type].copy();
-    c.a *= alpha;
-    for (const b of blocks)
-    {
-        if (b.y < 0 || b.y >= BOARD_H) continue;
-        drawCell(b.x, b.y, c, scale);
-    }
-}
-
-function drawMiniPiece(type, rot, centerWorld, scale=0.7)
-{
-    const blocks = PIECE_ROTS[type][mod(rot,4)];
-    const c = PIECE_COLORS[type];
-    const s = vec2(scale);
-
-    // center the 4x4 around the given point
-    const base = centerWorld.add(vec2(-2*scale, -2*scale));
-    for (const p of blocks)
-    {
-        const wp = base.add(vec2((p.x + .5)*scale*1, (p.y + .5)*scale*1));
-        drawRect(wp, s.scale(.92), c);
-        drawRect(wp, s.scale(.72), c.scale(.88));
-    }
-}
-
-function handleRepeat(dirKey, dir)
-{
-    const isDown = keyIsDown(dirKey);
-    const wasPressed = keyWasPressed(dirKey);
-
-    if (wasPressed)
-    {
-        tryMove(dir, 0);
-        if (dir < 0) leftNextRepeat = time + DAS;
-        else rightNextRepeat = time + DAS;
-    }
-
-    if (!isDown)
-    {
-        if (dir < 0) leftNextRepeat = 0;
-        else rightNextRepeat = 0;
-        return;
-    }
-
-    const nextT = dir < 0 ? leftNextRepeat : rightNextRepeat;
-    if (nextT && time >= nextT)
-    {
-        tryMove(dir, 0);
-        const t = time + ARR;
-        if (dir < 0) leftNextRepeat = t;
-        else rightNextRepeat = t;
-    }
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Minimal self-tests (console asserts)
-////////////////////////////////////////////////////////////////////////////////
 
 function runSelfTests()
 {
-    // rotations and blocks
-    console.assert(PIECE_ROTS.length === 7, 'Expected 7 piece types');
-    for (let t=0; t<7; ++t)
-    {
-        console.assert(PIECE_ROTS[t].length === 4, 'Expected 4 rotations for ' + PIECE_NAMES[t]);
-        for (let r=0; r<4; ++r)
-            console.assert(PIECE_ROTS[t][r].length === 4, 'Expected 4 blocks for ' + PIECE_NAMES[t] + ' rot ' + r);
-    }
+    // Basic runtime checks (non-fatal). Return false if something critical is missing.
+    const okSound = (typeof Sound == 'function');
+    const okBox2d = (typeof box2dInit == 'function');
+    const okWrap  = (typeof Box2dObject != 'undefined');
+    const okCircleSig = (typeof Box2dObject != 'undefined') && (typeof Box2dObject.prototype.addCircle == 'function');
 
-    // bag contains all pieces
-    refillBag();
-    const seen = new Set(bag);
-    console.assert(seen.size === 7, 'Bag should contain 7 unique pieces');
+    console.assert(okSound, 'LittleJS Sound class should exist');
+    console.assert(okBox2d, 'Box2D should be loaded (box2d.wasm.js)');
+    console.assert(okWrap,  'LittleJS Box2D wrapper classes should exist');
+    console.assert(okCircleSig, 'Box2dObject.addCircle should exist');
 
-    // collision bounds sanity (requires board)
-    emptyBoard();
-    const testType = 3; // O
-    console.assert(collides(vec2(-1, 0), 0, testType) === true, 'Should collide left out of bounds');
-    console.assert(collides(vec2(0, -2), 0, testType) === true, 'Should collide below board');
-    console.assert(collides(vec2(3, BOARD_H-4), 0, testType) === false, 'Spawn position should be valid on empty board');
+    return okSound && okBox2d && okWrap && okCircleSig;
 }
 
-///////////////////////////////////////////////////////////////////////////////
-function gameInit()
+// Added test cases: validate we never pass a non-boolean isSensor
+function assertCircleArgs(isSensor)
 {
-    setShowSplashScreen(false);
-    setCanvasFixedSize(vec2(960, 720));
-    setFontDefault('monospace');
-
-    makeSounds();
-    restartGame();
-    runSelfTests();
+    console.assert(typeof isSensor == 'boolean', 'isSensor must be boolean');
 }
 
-///////////////////////////////////////////////////////////////////////////////
+async function gameInit()
+{
+    // called once after the engine starts up
+    // IMPORTANT: Wrap init so any error shows on screen (not just console)
+    try
+    {
+        ready = false;
+        initError = '';
+
+        const ok = runSelfTests();
+        if (!ok)
+            throw new Error('Missing required LittleJS/Box2D pieces (see console asserts).');
+
+        // Our local test cases for argument types
+        assertCircleArgs(false);
+
+        // setup box2d first!
+        await box2dInit();
+
+        // pinball gravity (down)
+        gravity = vec2(0, -85);
+
+        // sounds (zzfx-style params; Sound.play(worldPos) supported)
+        // [volume, randomness, frequency, attack, sustain, release, shape, shapeCurve, slide,
+        //  deltaSlide, pitchJump, pitchJumpTime, repeatTime, noise, modulation, bitCrush, delay,
+        //  sustainVolume, decay, tremolo]
+        sfxBumper = new Sound([1.0, .06, 520, 0, .03, .10, 2, 0, 0, 0, 0, 0, 0, .02, 0, 0, 0, 1, 0, 0]);
+        sfxFlip   = new Sound([1.2, .03, 260, 0, .02, .08, 1, 0, 0, 0, 0, 0, 0, .01, 0, 0, 0, 1, 0, 0]);
+        sfxDrain  = new Sound([0.9, .10, 140, 0, .06, .28, 0, 0, -0.2, 0, 0, 0, 0, .06, 0, 0, 0, 1, 0, 0]);
+
+        makeWalls();
+        makeFlippers();
+
+        // bumpers (triangle-ish layout)
+        new Bumper(vec2(-3.5, 4.0), 1.15);
+        new Bumper(vec2( 0.0, 6.0), 1.20);
+        new Bumper(vec2( 3.5, 4.0), 1.15);
+
+        // a couple small posts (smaller bumpers)
+        const postA = new Bumper(vec2(-5.8, -1.0), .7); postA.color = hsl(.55,.6,.5);
+        const postB = new Bumper(vec2( 5.0, -1.5), .7); postB.color = hsl(.55,.6,.5);
+
+        spawnBall(false);
+
+        // extra sanity checks
+        console.assert(table, 'table should exist');
+        console.assert(ball, 'ball should exist');
+
+        ready = true;
+    }
+    catch(e)
+    {
+        initError = (e && (e.stack || e.message)) ? (e.stack || e.message) : 'Unknown init error';
+        console.error(e);
+        ready = false;
+    }
+}
+
 function gameUpdate()
 {
-    // FX always update (even on game over)
-    updateFX();
+    if (!ready) return;
 
-    if (gameOver)
+    // flipper input
+    const leftDown  = keyIsDown('ArrowLeft') || keyIsDown('KeyA');
+    const rightDown = keyIsDown('ArrowRight') || keyIsDown('KeyD');
+
+    // left joint angles go toward min when pressed (negative speed = CCW)
+    leftJoint && leftJoint.setMotorSpeed(leftDown ? -35 : 25);
+    rightJoint && rightJoint.setMotorSpeed(rightDown ? -35 : 25);
+
+    // sfx on press
+    if (keyWasPressed('ArrowLeft') || keyWasPressed('KeyA') ||
+        keyWasPressed('ArrowRight') || keyWasPressed('KeyD'))
+        sfxFlip && sfxFlip.play();
+
+    // launcher charge (Space)
+    if (ballIsInShooterLane())
     {
-        if (keyWasPressed('KeyR'))
-            restartGame();
+        canLaunch = true;
+
+        if (keyIsDown('Space'))
+            launchCharge = min(1, launchCharge + timeDelta*1.2);
+        else if (launchCharge > 0 && keyWasReleased('Space'))
+        {
+            // impulse upwards + slight left to enter field
+            const power = lerp(18, 55, launchCharge);
+            ball.applyAcceleration(vec2(-5, power));
+            launchCharge = 0;
+            canLaunch = false;
+        }
+    }
+    else
+    {
+        launchCharge = 0;
+        canLaunch = false;
+    }
+
+    // drain check
+    if (ballIsDrained())
+    {
+        sfxDrain && sfxDrain.play();
+        if (ballsLeft > 0)
+            spawnBall(true);
+        else
+        {
+            // game over -> restart
+            ballsLeft = 3;
+            score = 0;
+            spawnBall(false);
+        }
+    }
+
+    // gentle nudge (optional)
+    if (keyWasPressed('KeyQ')) { ball && ball.applyAcceleration(vec2(-8, 0)); }
+    if (keyWasPressed('KeyE')) { ball && ball.applyAcceleration(vec2( 8, 0)); }
+}
+
+function gameUpdatePost()
+{
+    // camera follows a bit upward to show action
+    const target = vec2(0, 1.0);
+    cameraPos = cameraPos.lerp(target, .08);
+    cameraScale = lerp(cameraScale, 28, .05);
+}
+
+function gameRender()
+{
+    // Always draw something so we never show a blank/white screen
+    drawRect(vec2(0,0), vec2(FIELD_W+1.2, FIELD_H+1.2), hsl(0,0,.12));
+    drawRect(vec2(0,0), vec2(FIELD_W, FIELD_H), hsl(0,0,.06));
+
+    // If not ready, also draw a simple "loading" indicator in-world
+    if (!ready)
+        drawText('Loading Box2D...', vec2(0,0), 1.2, WHITE, 0.1, hsl(0,0,0));
+}
+
+function gameRenderPost()
+{
+    if (!ready)
+    {
+        // Big on-screen message if init failed or still loading
+        const msg = initError ? 'Init Error (open console)' : 'Loading...';
+        drawTextScreen(msg, vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 - 30), 42, WHITE, 6, hsl(0,0,0));
+        if (initError)
+            drawTextScreen('If you can, paste the console error here.', vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 + 20), 24, WHITE, 4, hsl(0,0,0));
         return;
     }
 
-    // movement (with repeat)
-    handleRepeat('ArrowLeft', -1);
-    handleRepeat('ArrowRight', 1);
+    // HUD
+    const y = 40;
+    drawTextScreen(`SCORE ${score}`, vec2(140, y), 36, WHITE, 4, hsl(0,0,0));
+    drawTextScreen(`BALLS ${ballsLeft}`, vec2(140, y+40), 28, WHITE, 4, hsl(0,0,0));
 
-    // rotation
-    if (keyWasPressed('ArrowUp') || keyWasPressed('KeyX'))
-        tryRotate(1);
-    if (keyWasPressed('KeyZ'))
-        tryRotate(-1);
-
-    // hold
-    if (keyWasPressed('KeyC') || keyWasPressed('ShiftLeft') || keyWasPressed('ShiftRight'))
-        holdPiece();
-
-    // hard drop
-    if (keyWasPressed('Space'))
-        hardDrop();
-
-    // gravity
-    const softDrop = keyIsDown('ArrowDown');
-    fallTimer += timeDelta;
-
-    const fallInterval = softDrop ? SOFT_DROP_INTERVAL : levelFallInterval();
-    while (fallTimer >= fallInterval)
+    // launcher UI
+    if (canLaunch)
     {
-        fallTimer -= fallInterval;
-        if (tryMove(0, -1))
-        {
-            if (softDrop)
-            {
-                score += 1;
-
-                // small falling trail
-                const blocks = getBlocks(active.pos, active.rot, active.type);
-                const c = PIECE_COLORS[active.type];
-                for (const b of blocks)
-                {
-                    if (b.y < 0 || b.y >= BOARD_H) continue;
-                    const wp = boardOrigin.add(vec2(b.x + .5, b.y + .5 + .4));
-                    spawnParticles(wp, c, 1, 4, 0.10, 0.16, 1);
-                }
-            }
-        }
-        else
-            break;
+        const w = 220, h = 16;
+        const x = mainCanvasSize.x - w/2 - 30;
+        const y2 = mainCanvasSize.y - 50;
+        drawRectScreen(vec2(x,y2), vec2(w,h), hsl(0,0,.2));
+        drawRectScreen(vec2(x - (w*(1-launchCharge))/2, y2), vec2(w*launchCharge,h), hsl(.12,.8,.55));
+        drawTextScreen(`HOLD SPACE`, vec2(x, y2-26), 22, WHITE, 3, hsl(0,0,0));
     }
 
-    // lock delay when resting
-    if (isResting())
-    {
-        lockTimer += timeDelta;
-        if (lockTimer >= LOCK_DELAY)
-            lockPiece(false);
-    }
-    else
-        lockTimer = 0;
+    // controls hint
+    drawTextScreen(`←/A and →/D = flippers   Space = launch   Q/E = nudge`,
+        vec2(mainCanvasSize.x/2, mainCanvasSize.y-22), 22, WHITE, 3, hsl(0,0,0));
 }
 
-///////////////////////////////////////////////////////////////////////////////
-function gameUpdatePost()
-{
-    // camera shake
-    if (shakeTime > 0)
-    {
-        const s = shakeStrength;
-        cameraPos = vec2((rand()*2-1)*s, (rand()*2-1)*s);
-    }
-    else
-        cameraPos = vec2(0, 0);
-}
-
-///////////////////////////////////////////////////////////////////////////////
-function gameRender()
-{
-    // background
-    drawRect(cameraPos, vec2(200, 200), rgb(.05,.05,.06));
-
-    // board frame
-    drawRect(boardCenter, vec2(BOARD_W + .45, BOARD_H + .45), rgb(.18,.18,.20));
-    drawRect(boardCenter, vec2(BOARD_W + .10, BOARD_H + .10), rgb(.09,.09,.11));
-
-    // subtle grid
-    for (let x=0; x<=BOARD_W; ++x)
-    {
-        const a = boardOrigin.add(vec2(x, 0));
-        const b = boardOrigin.add(vec2(x, BOARD_H));
-        drawLine(a, b, .04, rgb(.12,.12,.14));
-    }
-    for (let y=0; y<=BOARD_H; ++y)
-    {
-        const a = boardOrigin.add(vec2(0, y));
-        const b = boardOrigin.add(vec2(BOARD_W, y));
-        drawLine(a, b, .04, rgb(.12,.12,.14));
-    }
-
-    // locked blocks
-    for (let y=0; y<BOARD_H; ++y)
-    for (let x=0; x<BOARD_W; ++x)
-    {
-        const t = board[y][x];
-        if (t !== -1)
-            drawCell(x, y, PIECE_COLORS[t], 1);
-    }
-
-    // ghost
-    const gy = ghostY();
-    drawPieceAt(active.type, active.rot, vec2(active.pos.x, gy), .25, 1);
-
-    // active piece (tiny idle pulse)
-    const pulse = 1 + 0.02*Math.sin(time*8);
-    drawPieceAt(active.type, active.rot, active.pos, 1, pulse);
-
-    // render FX over the board
-    renderFXWorld();
-
-    // landing pulse overlay (quick squash ring at the bottom of piece)
-    if (landPulse > 0)
-    {
-        const blocks = getBlocks(active.pos, active.rot, active.type);
-        let minY = 1e9;
-        for (const b of blocks) minY = min(minY, b.y);
-        const alpha = clamp(landPulse, 0, 1);
-        const c = PIECE_COLORS[active.type].copy();
-        c.a = 0.22 * alpha;
-        const y = clamp(minY, 0, BOARD_H-1);
-        const p = boardOrigin.add(vec2(BOARD_W/2, y + .5));
-        drawRect(p, vec2(BOARD_W, 1 + 0.35*(1-alpha)), c);
-    }
-
-    // panel background
-    drawRect(vec2(panelX, 0), vec2(7.5, 20.5), rgb(.08,.08,.10));
-    drawRect(vec2(panelX, 0), vec2(7.2, 20.2), rgb(.06,.06,.08));
-
-    // labels in world space
-    drawText('NEXT', vec2(panelX, 8.8), 0.8, hsl(0,0,1), 0.15, hsl(0,0,0), 'center');
-    drawText('HOLD', vec2(panelX, 2.8), 0.8, hsl(0,0,1), 0.15, hsl(0,0,0), 'center');
-
-    // next + hold mini pieces
-    drawMiniPiece(nextType, 0, vec2(panelX, 6.6), 0.75);
-    if (holdType !== -1)
-        drawMiniPiece(holdType, 0, vec2(panelX, 0.6), 0.75);
-
-    // stats (use \n, do not put literal newlines inside quotes)
-    drawText('SCORE\n' + score, vec2(panelX, -3.0), 0.7, hsl(0,0,1), 0.12, hsl(0,0,0));
-    drawText('LEVEL\n' + level, vec2(panelX, -5.8), 0.7, hsl(0,0,1), 0.12, hsl(0,0,0));
-    drawText('LINES\n' + lines, vec2(panelX, -8.6), 0.7, hsl(0,0,1), 0.12, hsl(0,0,0));
-}
-
-///////////////////////////////////////////////////////////////////////////////
-function gameRenderPost()
-{
-    // controls overlay
-    const p = vec2(mainCanvasSize.x/2, mainCanvasSize.y - 26);
-    drawTextScreen('←/→ move   ↓ soft   ↑/X rotate   Z ccw   Space hard   C hold   R restart',
-        p, 18, hsl(0,0,1,.75), 4, hsl(0,0,0,.6));
-
-    if (gameOver)
-    {
-        drawTextScreen('GAME OVER', vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 - 40), 78, hsl(0,0,1), 10, hsl(0,0,0));
-        drawTextScreen('Press R to Restart', vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 + 30), 32, hsl(0,0,1), 8, hsl(0,0,0));
-    }
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// Startup LittleJS Engine
 engineInit(gameInit, gameUpdate, gameUpdatePost, gameRender, gameRenderPost);
-
 </script>
-</body>
-</html>
