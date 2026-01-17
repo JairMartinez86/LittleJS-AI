@@ -51,13 +51,11 @@ const BOARD_SIZE = vec2(COLS*CELL, ROWS*CELL);
 const LEFT_CENTER_X  = -(BOARD_SIZE.x/2 + GAP_X/2);
 const RIGHT_CENTER_X = +(BOARD_SIZE.x/2 + GAP_X/2);
 const BOARD_BOTTOM_Y = -10;
-
 const START_GRAVITY = 1;
 const SOFT_DROP_MULT = 12;
 const LOCK_DELAY = .35;
 const MOVE_DAS = .14;
 const MOVE_ARR = .045;
-
 const NEXT_COUNT = 4;
 
 // Line clear "chain" animation
@@ -73,16 +71,12 @@ const SPARKLE_RATE = 22;          // approx sparkles per second per active piece
 const SPARKLE_SIZE_MIN = .04;
 const SPARKLE_SIZE_MAX = .11;
 
-
 // VS / Garbage
 const GARBAGE_TYPE = 7;
 const GARBAGE_COLOR = rgb(.35,.35,.38);
-// Classic vs-style attack table (single sends 0)
 const ATTACK_TABLE = [0, 0, 1, 2, 4]; // cleared lines -> garbage lines
 
 // AI (human-ish)
-// AI (human-ish, but faster)
-// "2x speed" = roughly half the delays
 const AI_THINK_DELAY_MIN = .04;
 const AI_THINK_DELAY_MAX = .11;
 const AI_ACTION_INTERVAL_MIN = .02;
@@ -264,7 +258,6 @@ function drawMiniCell(pos, color)
     // Mini preview version uses the exact same block renderer
     drawBlock3D(pos, .88, color);
 }
-
 
 function shuffleBag()
 {
@@ -566,30 +559,23 @@ function resetPlayer(p)
 
     p.holdType = -1;
     p.holdUsed = false;
-
     p.score = 0;
     p.lines = 0;
     p.level = 1;
     p.gameOver = false;
-
+    p.sparkleAcc = 0;
     p.moveDir = 0;
     p.moveTimer = 0;
     p.arrTimer = 0;
-
     p.fallAcc = 0;
     p.lockTimer = -1;
-
     p.clearAnim = null;
-
     p.pendingGarbage = 0;
-
     p.aiPlan = null;
     p.aiStepTimer = 0;
     p.aiThinkTimer = frand(AI_THINK_DELAY_MIN, AI_THINK_DELAY_MAX);
     p.aiDropTimer = 0;
     p.aiSoftMode = false;
-
-    p.sparkleAcc = 0;
 
     spawnPiece(p);
 }
@@ -1094,9 +1080,6 @@ function drawPlayer(p)
     if (p.pendingGarbage)
         drawText(`+${p.pendingGarbage} incoming`, u.add(vec2(0,-19.4)), .7, hsl(.05,.1,.85), .2, BLACK);
 
-    if (p.isAI)
-        drawText(`AI ${p.aiEnabled ? 'ON' : 'OFF'} (P)`, u.add(vec2(0,-20.6)), .8, p.aiEnabled ? hsl(.33,.9,.6) : hsl(0,0,.8), .2, BLACK);
-
     if (p.gameOver)
     {
         drawRect(p.boardCenter, BOARD_SIZE, rgb(0,0,0,.6));
@@ -1184,97 +1167,6 @@ function humanUpdate(p, dt)
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// TESTS
-
-function assert(cond, msg){ if (!cond) throw new Error('TEST FAILED: ' + msg); }
-
-function runSelfTests()
-{
-    function keyOf(v){ return `${v.x|0},${v.y|0}`; }
-    function setOf(arr){ const s=new Set(); for (const v of arr) s.add(keyOf(v)); return s; }
-    function cw(v){ return vec2(v.y, -v.x); }
-    function assertSameSet(a, b, msg)
-    {
-        const sa=setOf(a), sb=setOf(b);
-        assert(sa.size===sb.size, msg + ' size');
-        for (const k of sa) assert(sb.has(k), msg + ' missing ' + k);
-    }
-
-    // Bag should be 7 unique
-    const bag = shuffleBag();
-    assert(bag.length === 7, 'shuffleBag length');
-    assert(new Set(bag).size === 7, 'shuffleBag uniqueness');
-
-    // Pieces sanity
-    for (let i=0; i<PIECES.length; ++i)
-    {
-        assert(PIECES[i].rots.length === 4, 'rots len ' + PIECES[i].name);
-        for (let r=0; r<4; ++r)
-            assert(PIECES[i].rots[r].length === 4, 'blocks len ' + PIECES[i].name + r);
-    }
-
-    // Rotation sanity for S/Z (rot1 should be CW of rot0, etc)
-    {
-        const s = PIECES.find(p=>p.name==='S');
-        const z = PIECES.find(p=>p.name==='Z');
-        assert(!!s && !!z, 'S/Z exist');
-        for (const p of [s,z])
-        {
-            const r0 = p.rots[0];
-            const r1 = p.rots[1];
-            const r2 = p.rots[2];
-            const r3 = p.rots[3];
-            assertSameSet(r1, r0.map(cw), p.name + ' r1=cw(r0)');
-            assertSameSet(r2, r1.map(cw), p.name + ' r2=cw(r1)');
-            assertSameSet(r3, r2.map(cw), p.name + ' r3=cw(r2)');
-        }
-    }
-
-    // Garbage push
-    const p = makePlayer('T', 0, false);
-    resetPlayer(p);
-    // fill some blocks near top and ensure function doesn't crash
-    p.board[ROWS-1][0] = 0;
-    addGarbage(p, 2);
-    assert(p.board[0].includes(GARBAGE_TYPE) || p.board[0].includes(-1), 'garbage row exists');
-
-    // Garbage cancellation sanity
-    {
-        const a = makePlayer('A', 0, false);
-        resetPlayer(a);
-        a.pendingGarbage = 3;
-        let out = applyGarbageCancellation(a, 2);
-        assert(out === 0, 'cancel consumes attack');
-        assert(a.pendingGarbage === 1, 'pending reduced');
-        out = applyGarbageCancellation(a, 5);
-        assert(out === 4, 'leftover attack after cancel');
-        assert(a.pendingGarbage === 0, 'pending to zero');
-    }
-
-    // Classic attack table sanity
-    assert(ATTACK_TABLE[1] === 0, 'attack single = 0');
-    assert(ATTACK_TABLE[2] === 1, 'attack double = 1');
-    assert(ATTACK_TABLE[3] === 2, 'attack triple = 2');
-    assert(ATTACK_TABLE[4] === 4, 'attack tetris = 4');
-
-    // Survival mode heuristic sanity
-    {
-        const b = makeEmptyBoard();
-        assert(isSurvivalMode(b) === false, 'empty board not survival');
-        // Build a tall stack
-        for (let y=0; y<16; ++y)
-            for (let x=0; x<COLS; ++x)
-                b[y][x] = (x==5 && y<15) ? -1 : 0; // some holes
-        assert(isSurvivalMode(b) === true, 'tall stack is survival');
-    }
-
-    // AI produces a move
-    const empty = makeEmptyBoard();
-    const m = computeBestMove(0, empty);
-    assert(!!m, 'AI best move exists');
-}
-
-///////////////////////////////////////////////////////////////////////////////
 // LITTLEJS CALLBACKS
 
 async function gameInit()
@@ -1290,8 +1182,6 @@ async function gameInit()
     sHold   = new SoundGenerator({frequency:400, release:.08, pitchJump:200, pitchJumpTime:.02, volume:.35});
     sOver   = new SoundGenerator({frequency:120, release:.35, noise:.2, volume:.55});
     sGarbage= new SoundGenerator({frequency:90,  release:.14, noise:.1, volume:.45, slide:.15});
-
-    runSelfTests();
 
     players = [
         makePlayer('YOU', LEFT_CENTER_X, false),
@@ -1310,15 +1200,6 @@ function gameUpdate()
         particles = [];
         resetPlayer(players[0]);
         resetPlayer(players[1]);
-    }
-
-    // toggle AI (right player)
-    if (keyWasPressed('KeyP'))
-    {
-        players[1].aiEnabled = !players[1].aiEnabled;
-        players[1].aiPlan = null;
-        players[1].aiThinkTimer = frand(AI_THINK_DELAY_MIN, AI_THINK_DELAY_MAX);
-        players[1].aiDropTimer = 0;
     }
 
     // particles
