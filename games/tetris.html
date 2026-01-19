@@ -1,5 +1,5 @@
 <!DOCTYPE html><head>
-<title>LittleJS Tetris VS AI</title>
+<title>LittleJS Tetris</title>
 <meta charset="utf-8">
 </head><body style="background:#000">
 <script src="https://cdn.jsdelivr.net/npm/littlejsengine@1.17.15/dist/littlejs.js"></script>
@@ -142,11 +142,15 @@ const KICKS = [vec2(0,0), vec2(-1,0), vec2(1,0), vec2(0,1), vec2(-2,0), vec2(2,0
 ///////////////////////////////////////////////////////////////////////////////
 // GLOBAL STATE
 
+let gameState = 'menu'; // 'menu' or 'playing'
+let gameMode = 'vs';    // 'single' or 'vs'
+let menuSelection = 0;  // 0 = single player, 1 = vs AI
+
 let players = []; // [human, ai]
 let particles = [];
 
 // sounds
-let sMove, sRotate, sDrop, sLock, sClear, sHold, sOver, sGarbage;
+let sMove, sRotate, sDrop, sLock, sClear, sHold, sOver, sGarbage, sSelect;
 
 ///////////////////////////////////////////////////////////////////////////////
 // HELPERS
@@ -1178,28 +1182,77 @@ async function gameInit()
     sHold   = new SoundGenerator({frequency:400, release:.08, pitchJump:200, pitchJumpTime:.02, volume:.35});
     sOver   = new SoundGenerator({frequency:120, release:.35, noise:.2, volume:.55});
     sGarbage= new SoundGenerator({frequency:90,  release:.14, noise:.1, volume:.45, slide:.15});
+    sSelect = new SoundGenerator({frequency:440, release:.08, volume:.3});
 
-    players = [
-        makePlayer('YOU', LEFT_CENTER_X, false),
-        makePlayer('AI',  RIGHT_CENTER_X, true),
-    ];
+    gameState = 'menu';
+    menuSelection = 0;
+}
 
-    resetPlayer(players[0]);
-    resetPlayer(players[1]);
+function startGame(mode)
+{
+    gameMode = mode;
+    gameState = 'playing';
+    particles = [];
+
+    if (mode === 'single')
+    {
+        // Single player - centered board
+        players = [
+            makePlayer('YOU', 0, false),
+        ];
+        resetPlayer(players[0]);
+    }
+    else
+    {
+        // VS AI - two boards
+        players = [
+            makePlayer('YOU', LEFT_CENTER_X, false),
+            makePlayer('AI',  RIGHT_CENTER_X, true),
+        ];
+        resetPlayer(players[0]);
+        resetPlayer(players[1]);
+    }
 }
 
 function gameUpdate()
 {
-    // restart
+    if (gameState === 'menu')
+    {
+        // Menu navigation
+        if (keyWasPressed('ArrowUp') || keyWasPressed('KeyW'))
+        {
+            menuSelection = (menuSelection + 1) % 2;
+            sSelect && sSelect.play();
+        }
+        if (keyWasPressed('ArrowDown') || keyWasPressed('KeyS'))
+        {
+            menuSelection = (menuSelection + 1) % 2;
+            sSelect && sSelect.play();
+        }
+        if (keyWasPressed('Enter') || keyWasPressed('Space'))
+        {
+            startGame(menuSelection === 0 ? 'single' : 'vs');
+            sSelect && sSelect.play();
+        }
+        return;
+    }
+
+    // Playing state
+    // restart / return to menu
     if (keyWasPressed('KeyR'))
     {
         particles = [];
         resetPlayer(players[0]);
-        resetPlayer(players[1]);
+        if (gameMode === 'vs') resetPlayer(players[1]);
+    }
+    if (keyWasPressed('Escape'))
+    {
+        gameState = 'menu';
+        return;
     }
 
-    // DEBUG: press G to send garbage to AI
-    if (keyWasPressed('KeyG'))
+    // DEBUG: press G to send garbage to AI (only in vs mode)
+    if (gameMode === 'vs' && keyWasPressed('KeyG'))
     {
         players[1].pendingGarbage += 1;
     }
@@ -1209,26 +1262,24 @@ function gameUpdate()
 
     // ambient sparkles on active pieces
     stepPieceSparkles(players[0], timeDelta);
-    stepPieceSparkles(players[1], timeDelta);
+    if (gameMode === 'vs') stepPieceSparkles(players[1], timeDelta);
 
     const human = players[0];
-    const ai = players[1];
+    const ai = gameMode === 'vs' ? players[1] : null;
 
     // clear anims first (they pause gameplay for that player)
     if (human.clearAnim) stepClearAnim(human, ai, timeDelta);
-    if (ai.clearAnim) stepClearAnim(ai, human, timeDelta);
+    if (ai && ai.clearAnim) stepClearAnim(ai, human, timeDelta);
 
-    // If someone is KO'd, pause ALL gameplay input/AI (but let particles + any in-progress clear animation run)
-    if (human.gameOver || ai.gameOver)
+    // If someone is KO'd, pause ALL gameplay input/AI
+    if (human.gameOver || (ai && ai.gameOver))
         return;
 
     if (!human.clearAnim)
         humanUpdate(human, timeDelta);
 
-    if (!ai.clearAnim)
+    if (ai && !ai.clearAnim)
         stepAI(ai, timeDelta);
-
-    // end condition: if someone is KO'd, allow restart
 }
 
 function gameUpdatePost()
@@ -1241,26 +1292,64 @@ function gameRender()
     // background
     drawRect(cameraPos, getCameraSize(), rgb(.06,.06,.07));
 
-    // center divider
-    drawRect(vec2(0,0), vec2(.15, 28), rgb(.12,.12,.14));
+    if (gameState === 'menu')
+    {
+        // Title
+        drawText('TETRIS', vec2(0, 5), 4, hsl(.55, .9, .6), .4, BLACK);
+        
+        // Menu options
+        const opt1Color = menuSelection === 0 ? hsl(.14, .9, .6) : hsl(0, 0, .6);
+        const opt2Color = menuSelection === 1 ? hsl(.14, .9, .6) : hsl(0, 0, .6);
+        
+        drawText(menuSelection === 0 ? '> SINGLE PLAYER <' : '  SINGLE PLAYER  ', vec2(0, 0), 1.8, opt1Color, .25, BLACK);
+        drawText(menuSelection === 1 ? '> VS AI <' : '  VS AI  ', vec2(0, -2.5), 1.8, opt2Color, .25, BLACK);
+        
+        // Instructions
+        drawText('Use UP/DOWN to select, ENTER to start', vec2(0, -6), 1, hsl(0, 0, .5), .15, BLACK);
+        return;
+    }
 
-    drawPlayer(players[0]);
-    drawPlayer(players[1]);
+    // Playing state
+    if (gameMode === 'vs')
+    {
+        // center divider
+        drawRect(vec2(0,0), vec2(.15, 28), rgb(.12,.12,.14));
+        drawPlayer(players[0]);
+        drawPlayer(players[1]);
+    }
+    else
+    {
+        // single player - just draw one board
+        drawPlayer(players[0]);
+    }
 
     renderParticles();
 
     // bottom help
-    drawText('Controls: Arrows/A-D move, Up/X rotate, Z CCW, Space drop, C/Shift hold, R restart, P toggle AI', vec2(0,-13.2), .7, hsl(0,0,.85), .15, BLACK);
+    const helpText = gameMode === 'vs' 
+        ? 'Arrows/A-D move, Up/X rotate, Z CCW, Space drop, C/Shift hold, R restart, ESC menu'
+        : 'Arrows/A-D move, Up/X rotate, Z CCW, Space drop, C/Shift hold, R restart, ESC menu';
+    drawText(helpText, vec2(0,-13.2), .7, hsl(0,0,.85), .15, BLACK);
 
     // win/lose banner
     const hKO = players[0].gameOver;
-    const aKO = players[1].gameOver;
+    const aKO = gameMode === 'vs' ? players[1].gameOver : false;
     if (hKO || aKO)
     {
         drawRect(vec2(0,0), getCameraSize(), rgb(0,0,0,.55));
-        const msg = hKO && aKO ? 'DOUBLE KO' : hKO ? 'YOU LOSE' : 'YOU WIN';
-        drawText(msg, vec2(0,2.5), 3.2, hKO && !aKO ? RED : (aKO && !hKO ? hsl(.33,.9,.6) : WHITE), .4, BLACK);
-        drawText('Press R to restart', vec2(0,-1.0), 1.2, WHITE, .25, BLACK);
+        let msg, msgColor;
+        if (gameMode === 'single')
+        {
+            msg = 'GAME OVER';
+            msgColor = WHITE;
+        }
+        else
+        {
+            msg = hKO && aKO ? 'DOUBLE KO' : hKO ? 'YOU LOSE' : 'YOU WIN';
+            msgColor = hKO && !aKO ? RED : (aKO && !hKO ? hsl(.33,.9,.6) : WHITE);
+        }
+        drawText(msg, vec2(0,2.5), 3.2, msgColor, .4, BLACK);
+        drawText('Press R to restart, ESC for menu', vec2(0,-1.0), 1.2, WHITE, .25, BLACK);
     }
 }
 
