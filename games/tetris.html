@@ -52,7 +52,7 @@ const LEFT_CENTER_X  = -(BOARD_SIZE.x/2 + GAP_X/2);
 const RIGHT_CENTER_X = +(BOARD_SIZE.x/2 + GAP_X/2);
 const BOARD_BOTTOM_Y = -10;
 const START_GRAVITY = 1;
-const SOFT_DROP_MULT = 12;
+const SOFT_DROP_MULT = 24;
 const LOCK_DELAY = .5; // time before piece locks after touching ground
 const MOVE_DAS = .14;
 const MOVE_ARR = .045;
@@ -147,6 +147,12 @@ let gameMode = 'vs';    // 'single' or 'vs'
 
 // Menu UI elements
 let menuTitle, btnSinglePlayer, btnVsAI, menuInstructions;
+
+// Menu background animation
+let menuBgPieces = [];
+let menuSpawnTimer = 0;
+const MENU_SPAWN_RATE = 0.4; // seconds between spawns
+const MENU_FALL_SPEED = 3; // cells per second
 
 let players = []; // [human, ai]
 let particles = [];
@@ -964,28 +970,33 @@ function stepAI(p, dt)
         return;
     }
 
-    // aligned: pause a bit before dropping
-    p.aiDropTimer += dt;
-    const dropDelay = p.aiSoftMode ? frand(AI_DROP_DELAY_MIN, AI_DROP_DELAY_MAX) * 1.35 : frand(AI_DROP_DELAY_MIN, AI_DROP_DELAY_MAX);
-    if (p.aiDropTimer < dropDelay)
-        return;
-
-    // soft drop mode: step down over time (more human)
-    if (p.aiSoftMode)
+    // aligned: use gravity-based drop speed (same as human soft drop)
+    const cps = gravityCellsPerSecond(p) * SOFT_DROP_MULT;
+    p.fallAcc += cps * dt;
+    
+    while (p.fallAcc >= 1)
     {
-        p.aiDropTimer = 0;
+        p.fallAcc -= 1;
         if (!tryMove(p, 0, -1))
         {
             // lock when grounded
+            if (p.lockTimer < 0)
+                p.lockTimer = LOCK_DELAY;
+            break;
+        }
+    }
+    
+    // handle lock timer
+    if (p.lockTimer >= 0)
+    {
+        p.lockTimer -= dt;
+        if (p.lockTimer <= 0)
+        {
+            while (tryMove(p, 0, -1)) {}
             lockPiece(p, false);
             p.aiPlan = null;
         }
-        return;
     }
-
-    // otherwise hard drop
-    hardDrop(p);
-    p.aiPlan = null;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1195,6 +1206,9 @@ async function gameInit()
     createMenuUI();
 
     gameState = 'menu';
+    
+    // Warm up menu background
+    showMenuUI(true);
 }
 
 function createMenuUI()
@@ -1232,7 +1246,7 @@ function createMenuUI()
     btnVsAI.onClick = () => startGame('vs');
 
     // Instructions
-    menuInstructions = new UIText(vec2(cx, cy + 180), vec2(500, 40), 'Click or use Arrow Keys + Enter');
+    menuInstructions = new UIText(vec2(cx, cy + 180), vec2(500, 40), 'Made by LittleJS AI');
     menuInstructions.textColor = hsl(0, 0, .5);
     menuInstructions.textLineWidth = 0;
 }
@@ -1243,6 +1257,79 @@ function showMenuUI(visible)
     btnSinglePlayer.visible = visible;
     btnVsAI.visible = visible;
     menuInstructions.visible = visible;
+    
+    // Reset and warm up background pieces when showing menu
+    if (visible)
+    {
+        menuBgPieces = [];
+        // Spawn initial pieces scattered across the screen
+        for (let i = 0; i < 15; i++)
+        {
+            const type = randInt(PIECES.length);
+            const rot = randInt(4);
+            menuBgPieces.push({
+                type,
+                rot,
+                x: frand(-12, 12),
+                y: frand(-14, 14),
+                fallSpeed: MENU_FALL_SPEED + frand(-0.5, 1),
+                alpha: frand(0.15, 0.35),
+                scale: frand(0.7, 1.1),
+            });
+        }
+    }
+}
+
+function updateMenuBackground(dt)
+{
+    // Spawn new pieces
+    menuSpawnTimer -= dt;
+    if (menuSpawnTimer <= 0)
+    {
+        menuSpawnTimer = MENU_SPAWN_RATE + frand(-0.15, 0.15);
+        
+        // Spawn a random piece at top
+        const type = randInt(PIECES.length);
+        const rot = randInt(4);
+        menuBgPieces.push({
+            type,
+            rot,
+            x: frand(-12, 12),
+            y: 16,
+            fallSpeed: MENU_FALL_SPEED + frand(-0.5, 1),
+            alpha: frand(0.15, 0.35),
+            scale: frand(0.7, 1.1),
+        });
+    }
+    
+    // Update pieces
+    for (let i = menuBgPieces.length - 1; i >= 0; i--)
+    {
+        const p = menuBgPieces[i];
+        p.y -= p.fallSpeed * dt;
+        
+        // Remove if off screen
+        if (p.y < -16)
+            menuBgPieces.splice(i, 1);
+    }
+}
+
+function renderMenuBackground()
+{
+    for (const p of menuBgPieces)
+    {
+        const blocks = getBlocks(p.type, p.rot);
+        const baseColor = PIECES[p.type].color;
+        const color = baseColor.copy();
+        color.a = p.alpha;
+        
+        for (const b of blocks)
+        {
+            const wx = p.x + b.x * p.scale;
+            const wy = p.y + b.y * p.scale;
+            drawRect(vec2(wx, wy), vec2(p.scale * 0.9), color);
+        }
+    }
 }
 
 function startGame(mode)
@@ -1276,7 +1363,8 @@ function gameUpdate()
 {
     if (gameState === 'menu')
     {
-        // UI system handles menu interaction
+        // Animate menu background
+        updateMenuBackground(timeDelta);
         return;
     }
 
@@ -1338,7 +1426,9 @@ function gameRender()
 
     if (gameState === 'menu')
     {
-        // UI system renders the menu
+        // Draw falling pieces background
+        renderMenuBackground();
+        // UI system renders the menu on top
         return;
     }
 
