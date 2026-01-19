@@ -1545,7 +1545,7 @@ function gameRender()
     const helpText = gameMode === 'vs' 
         ? 'Arrows/A-D move, Up/X rotate, Z CCW, Space drop, C/Shift hold, R restart, ESC menu'
         : 'Arrows/A-D move, Up/X rotate, Z CCW, Space drop, C/Shift hold, R restart, ESC menu';
-    drawText(helpText, vec2(0,-13.2), .7, hsl(0,0,.85), .15, BLACK);
+    drawText(helpText, vec2(0,-11.5), .6, hsl(0,0,.7), .12, BLACK);
 
     // win/lose banner
     const hKO = players[0].gameOver;
