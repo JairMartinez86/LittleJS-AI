@@ -10,10 +10,11 @@
 debugWatermark = false;
 showEngineVersion = false;
 paused = false;
+setDebugKey('Backquote'); // Use tilde key instead of Escape for debug
 
 gravity = vec2(0, 0);
 cameraPos = vec2(0, 0);
-cameraScale = 22;
+cameraScale = 42;
 
 // AI can use this class to make sound effects
 class SoundGenerator extends Sound 
@@ -145,8 +146,8 @@ const KICKS = [vec2(0,0), vec2(-1,0), vec2(1,0), vec2(0,1), vec2(-2,0), vec2(2,0
 let gameState = 'menu'; // 'menu' or 'playing'
 let gameMode = 'vs';    // 'single' or 'vs'
 
-// Menu UI elements
-let menuTitle, btnSinglePlayer, btnVsAI, menuInstructions;
+// Menu UI elements (title drawn manually for animation)
+let btnSinglePlayer, btnVsAI, menuInstructions;
 
 // Menu background animation
 let menuBgPieces = [];
@@ -1190,7 +1191,7 @@ function humanUpdate(p, dt)
 
 async function gameInit()
 {
-    setCanvasFixedSize(vec2(960, 540));
+    setCanvasFixedSize(vec2(1920, 1080));
 
     // Initialize UI system
     new UISystemPlugin();
@@ -1219,47 +1220,42 @@ async function gameInit()
 
 function createMenuUI()
 {
-    // Canvas is 960x540, UI uses screen coordinates with center at (480, 270)
-    const cx = 480;
-    const cy = 270;
+    // Canvas is 1920x1080, UI uses screen coordinates with center at (960, 540)
+    const cx = 960;
+    const cy = 540;
 
-    // Title
-    menuTitle = new UIText(vec2(cx, cy - 120), vec2(400, 80), 'TETRIS');
-    menuTitle.textColor = hsl(.55, .9, .6);
-    menuTitle.textLineColor = BLACK;
-    menuTitle.textLineWidth = 6;
+    // Title is drawn manually in renderMenuTitle() for animation effect
 
     // Single Player button
-    btnSinglePlayer = new UIButton(vec2(cx, cy), vec2(280, 60), 'SINGLE PLAYER');
+    btnSinglePlayer = new UIButton(vec2(cx, cy), vec2(560, 120), 'SINGLE PLAYER');
     btnSinglePlayer.color = hsl(.55, .7, .35);
     btnSinglePlayer.hoverColor = hsl(.55, .8, .5);
     btnSinglePlayer.textColor = WHITE;
     btnSinglePlayer.textLineColor = BLACK;
-    btnSinglePlayer.textLineWidth = 3;
+    btnSinglePlayer.textLineWidth = 6;
     btnSinglePlayer.soundClick = sSelect;
     btnSinglePlayer.navigationIndex = 1;
     btnSinglePlayer.onClick = () => startGame('single');
 
     // VS AI button
-    btnVsAI = new UIButton(vec2(cx, cy + 80), vec2(280, 60), 'VS AI');
+    btnVsAI = new UIButton(vec2(cx, cy + 160), vec2(560, 120), 'VS AI');
     btnVsAI.color = hsl(.02, .7, .4);
     btnVsAI.hoverColor = hsl(.02, .8, .55);
     btnVsAI.textColor = WHITE;
     btnVsAI.textLineColor = BLACK;
-    btnVsAI.textLineWidth = 3;
+    btnVsAI.textLineWidth = 6;
     btnVsAI.soundClick = sSelect;
     btnVsAI.navigationIndex = 2;
     btnVsAI.onClick = () => startGame('vs');
 
     // Instructions
-    menuInstructions = new UIText(vec2(cx, cy + 180), vec2(500, 40), 'Made by LittleJS AI');
-    menuInstructions.textColor = hsl(0, 0, .5);
+    menuInstructions = new UIText(vec2(cx, cy + 360), vec2(1000, 80), 'Made by LittleJS AI');
+    menuInstructions.textColor = WHITE;
     menuInstructions.textLineWidth = 0;
 }
 
 function showMenuUI(visible)
 {
-    menuTitle.visible = visible;
     btnSinglePlayer.visible = visible;
     btnVsAI.visible = visible;
     menuInstructions.visible = visible;
@@ -1336,6 +1332,28 @@ function renderMenuBackground()
             drawRect(vec2(wx, wy), vec2(p.scale * 0.9), color);
         }
     }
+}
+
+function renderMenuTitle()
+{
+    const t = time * 1.5; // animation speed
+    const baseY = 5; // world Y position for title
+    
+    // Animated layers orbiting around the center
+    const numLayers = 6;
+    for (let i = 0; i < numLayers; i++)
+    {
+        const angle = t + i * (Math.PI * 2 / numLayers); // evenly spaced, rotating
+        const radius = 0.8 + Math.sin(t * 0.5 + i) * 0.3;
+        const offsetX = Math.cos(angle) * radius;
+        const offsetY = Math.sin(angle) * radius * 0.6;
+        const hue = (i / numLayers + t * 0.1) % 1; // cycling colors
+        const color = hsl(hue, .9, .55, .6);
+        drawText('TETRIS', vec2(offsetX, baseY + offsetY), 4, color, 0, CLEAR_BLACK);
+    }
+    
+    // Draw main white text on top
+    drawText('TETRIS', vec2(0, baseY), 4, WHITE, .6, BLACK);
 }
 
 function startGame(mode)
@@ -1434,6 +1452,10 @@ function gameRender()
     {
         // Draw falling pieces background
         renderMenuBackground();
+        
+        // Draw animated title
+        renderMenuTitle();
+        
         // UI system renders the menu on top
         return;
     }
