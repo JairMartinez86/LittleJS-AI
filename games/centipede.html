@@ -12,7 +12,7 @@
   </style>
 </head>
 <body>
-  <script src="https://cdn.jsdelivr.net/npm/littlejsengine@1.17.11/dist/littlejs.min.js"></script>
+  <script src="../AI/littlejs.js"></script>
   <script>
   'use strict';
 
@@ -152,7 +152,7 @@
           {
               this.cooldown = .12;
               new Bullet(this.pos.add(vec2(0, .7)));
-              sShoot.play(this.pos, 1, rand(-.08, .08));
+              sShoot.play(this.pos, 1);
           }
 
           // restart
@@ -202,7 +202,7 @@
           if (m)
           {
               m.damage();
-              sHit.play(this.pos, 1, rand(-.1,.1));
+              sHit.play(this.pos, 1, 1 + rand(-.1,.1));
               this.destroy();
               return;
           }
@@ -212,7 +212,7 @@
           if (hit)
           {
               hitSegment(hit.chain, hit.index, cell);
-              sSplit.play(this.pos, 1, rand(-.08,.08));
+              sSplit.play(this.pos, 1, 1 + rand(-.08,.08));
               this.destroy();
               return;
           }
@@ -510,7 +510,7 @@
   {
       if (gameOver) return;
       lives--;
-      sDie.play(player.pos, 1, rand(-.08,.08));
+      sDie.play(player.pos, 1, 1 + rand(-.08,.08));
 
       if (lives <= 0)
       {
