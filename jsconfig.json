@@ -1,0 +1,10 @@
+{
+  "compilerOptions": {
+  },
+  "include": [
+    "./games/*.js",
+    "./AI/littlejs.js",
+  ],
+  "exclude": [
+  ]
+}
