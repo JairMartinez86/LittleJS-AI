@@ -1032,6 +1032,11 @@ function gameUpdate()
     if (keyWasPressed('Digit3')) { sendPreset = 3; dragPercent = .50; }
     if (keyWasPressed('Digit4')) { sendPreset = 4; dragPercent = 1.00; }
 
+    // upgrade shortcuts
+    if (keyWasPressed('KeyQ')) tryBuyUpgrade(selectedPlanet, 0, OWNER_PLAYER, true);
+    if (keyWasPressed('KeyW')) tryBuyUpgrade(selectedPlanet, 1, OWNER_PLAYER, true);
+    if (keyWasPressed('KeyE')) tryBuyUpgrade(selectedPlanet, 2, OWNER_PLAYER, true);
+
     if (gameOver)
     {
         if (keyWasPressed('Space'))
@@ -1081,7 +1086,7 @@ function gameUpdate()
 
         if (mouseWheel)
         {
-            dragPercent = clamp01(dragPercent + mouseWheel * .05);
+            dragPercent = clamp01(dragPercent - mouseWheel * .05);
             const snaps = [.10, .25, .50, 1.0];
             for (let i = 0; i < snaps.length; ++i)
                 if (abs(dragPercent - snaps[i]) < .03) dragPercent = snaps[i];
@@ -1269,8 +1274,8 @@ function gameRenderPost()
     const helpY = mainCanvasSize.y - 120;
     drawTextScreen('── CONTROLS ──', vec2(panelX + panelW/2, helpY), 16, hsl(0,0,.5), 2, hsl(0,0,0));
     drawTextScreen('Drag: Send ships', vec2(panelX + panelW/2, helpY+24), 14, hsl(0,0,.6), 2, hsl(0,0,0));
-    drawTextScreen('1/2/3/4: Send %', vec2(panelX + panelW/2, helpY+44), 14, hsl(0,0,.6), 2, hsl(0,0,0));
-    drawTextScreen('Wheel: Fine adjust', vec2(panelX + panelW/2, helpY+64), 14, hsl(0,0,.6), 2, hsl(0,0,0));
+    drawTextScreen('Wheel: Adjust % send', vec2(panelX + panelW/2, helpY+44), 14, hsl(0,0,.6), 2, hsl(0,0,0));
+    drawTextScreen('Q: Prod  W: Cap  E: Def', vec2(panelX + panelW/2, helpY+64), 14, hsl(0,0,.6), 2, hsl(0,0,0));
     drawTextScreen('R: Restart  Esc: Menu', vec2(panelX + panelW/2, helpY+84), 14, hsl(0,0,.6), 2, hsl(0,0,0));
 
     // Debug mode indicator
