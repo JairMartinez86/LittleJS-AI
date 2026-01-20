@@ -997,9 +997,30 @@ function updateUpgradeButtons()
     if (show)
     {
         const p = selectedPlanet;
-        btnProduction.text = '⚡ Prod  Cost ' + prodCost(p.upProd);
-        btnCapacity.text = '📦 Cap   Cost ' + capCost(p.upCap);
-        btnDefense.text = '🛡️ Def   Cost ' + defCost(p.upDef);
+        const prodPrice = prodCost(p.upProd);
+        const capPrice = capCost(p.upCap);
+        const defPrice = defCost(p.upDef);
+        
+        btnProduction.text = '⚡ Prod  Cost ' + prodPrice;
+        btnCapacity.text = '📦 Cap   Cost ' + capPrice;
+        btnDefense.text = '🛡️ Def   Cost ' + defPrice;
+        
+        // Gray out buttons if not enough money
+        const canBuyProd = playerMoney >= prodPrice;
+        const canBuyCap = playerMoney >= capPrice;
+        const canBuyDef = playerMoney >= defPrice;
+        
+        btnProduction.color = canBuyProd ? hsl(.14, .6, .25) : hsl(0, 0, .2);
+        btnProduction.hoverColor = canBuyProd ? hsl(.14, .7, .4) : hsl(0, 0, .25);
+        btnProduction.textColor = canBuyProd ? hsl(0, 0, 1) : hsl(0, 0, .5);
+        
+        btnCapacity.color = canBuyCap ? hsl(.58, .6, .25) : hsl(0, 0, .2);
+        btnCapacity.hoverColor = canBuyCap ? hsl(.58, .7, .4) : hsl(0, 0, .25);
+        btnCapacity.textColor = canBuyCap ? hsl(0, 0, 1) : hsl(0, 0, .5);
+        
+        btnDefense.color = canBuyDef ? hsl(.33, .6, .25) : hsl(0, 0, .2);
+        btnDefense.hoverColor = canBuyDef ? hsl(.33, .7, .4) : hsl(0, 0, .25);
+        btnDefense.textColor = canBuyDef ? hsl(0, 0, 1) : hsl(0, 0, .5);
     }
 }
 
