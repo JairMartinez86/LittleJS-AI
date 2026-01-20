@@ -388,6 +388,19 @@ function gameUpdatePost()
 {
     // center camera
     setCameraPos(vec2());
+    
+    // Rapid slowdown when ball is moving slowly but not yet stopped
+    if (ball && !completeTimer.isSet())
+    {
+        const speed = ball.getSpeed();
+        const slowdownThreshold = STOP_SPEED * 10;  // 2.0 - starts slowing down earlier
+        if (speed > STOP_SPEED && speed < slowdownThreshold)
+        {
+            // Apply extra damping to rapidly slow down the ball
+            const vel = ball.getLinearVelocity();
+            ball.setLinearVelocity(vel.scale(0.92));  // reduce velocity each frame
+        }
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
