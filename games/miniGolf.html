@@ -678,6 +678,17 @@ function gameRenderPost()
             drawRectScreenSpace(vec2(cx - courseW/2 - wallThick/2, cy), vec2(wallThick, courseH), wallColor);  // left
             drawRectScreenSpace(vec2(cx + courseW/2 + wallThick/2, cy), vec2(wallThick, courseH), wallColor);  // right
             
+            // Draw white outline when hovered
+            if (hovered)
+            {
+                const outlineThick = 5;
+                const outlineW = courseW + wallThick*2 + 4;
+                const outlineH = courseH + wallThick*2 + 4;
+                const hw = outlineW/2, hh = outlineH/2;
+                drawPoly([vec2(-hw,-hh), vec2(hw,-hh), vec2(hw,hh), vec2(-hw,hh)], 
+                    rgb(0,0,0,0), outlineThick, WHITE, vec2(cx, cy), 0, false, true);
+            }
+            
             // Hole number
             drawTextScreen('Hole ' + (i+1), vec2(cx, cy - courseH/2 - wallThick - 16), 28, WHITE, 3, BLACK);
             
