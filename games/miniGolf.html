@@ -80,8 +80,9 @@ const holes = [
         tee:  vec2(-14, -5),
         hole: vec2( 14,  5),
         obstacles: [
-            {type:'box', pos:vec2(-5, 2), size:vec2(10, 1.2), angle:0},
-            {type:'box', pos:vec2( 5,-2), size:vec2(10, 1.2), angle:0},
+            {type:'box', pos:vec2(-7, 5), size:vec2(8, 1.2), angle:0},
+            {type:'box', pos:vec2( 7,-5), size:vec2(8, 1.2), angle:0},
+            {type:'circle', pos:vec2(0, 0), diameter:2.5},
         ],
     },
     // Hole 2: Pinball Bumpers - chaotic bounces
@@ -89,14 +90,14 @@ const holes = [
         tee:  vec2(-14, 0),
         hole: vec2( 14, 0),
         obstacles: [
-            {type:'circle', pos:vec2(-8,  3), diameter:2.5},
-            {type:'circle', pos:vec2(-8, -3), diameter:2.5},
+            {type:'circle', pos:vec2(-8,  5), diameter:2.5},
+            {type:'circle', pos:vec2(-8, -5), diameter:2.5},
             {type:'circle', pos:vec2(-3,  0), diameter:2.0},
-            {type:'circle', pos:vec2( 0,  4), diameter:2.2},
-            {type:'circle', pos:vec2( 0, -4), diameter:2.2},
+            {type:'circle', pos:vec2( 0,  6), diameter:2.2},
+            {type:'circle', pos:vec2( 0, -6), diameter:2.2},
             {type:'circle', pos:vec2( 3,  0), diameter:2.0},
-            {type:'circle', pos:vec2( 8,  3), diameter:2.5},
-            {type:'circle', pos:vec2( 8, -3), diameter:2.5},
+            {type:'circle', pos:vec2( 8,  5), diameter:2.5},
+            {type:'circle', pos:vec2( 8, -5), diameter:2.5},
         ],
     },
     // Hole 3: Corridor with pillars
