@@ -146,11 +146,11 @@ const holes = [
         hole: vec2( 12,  6),
         obstacles: [
             // Block top-right corner to create L-shape
-            {type:'box', pos:vec2( 8,  4), size:vec2(12, 1.2), angle:0},   // horizontal wall
-            {type:'box', pos:vec2( 2,  7), size:vec2(1.2, 6), angle:0},    // vertical wall (connects to edge)
+            {type:'box', pos:vec2( 8,  4), size:vec2(13.2, 1.2), angle:0},   // horizontal wall (extended by 1.2 for corner)
+            {type:'box', pos:vec2( 2,  7), size:vec2(1.2, 6), angle:0},      // vertical wall (connects to edge)
             // Block bottom-left to complete L
-            {type:'box', pos:vec2(-8, -2), size:vec2(10, 1.2), angle:0},   // horizontal 
-            {type:'box', pos:vec2(-3, -6), size:vec2(1.2, 8), angle:0},    // vertical
+            {type:'box', pos:vec2(-8, -2), size:vec2(11.2, 1.2), angle:0},   // horizontal (extended by 1.2 for corner)
+            {type:'box', pos:vec2(-3, -6), size:vec2(1.2, 8), angle:0},      // vertical
             // Obstacles in the path
             {type:'circle', pos:vec2(-8, 4), diameter:2.5},
             {type:'circle', pos:vec2( 8, -4), diameter:2.5},
@@ -631,8 +631,16 @@ function gameRenderPost()
             drawRectScreenSpace(vec2(cx, cy), vec2(courseW + 6, courseH + 6), bgColor);
             drawRectScreenSpace(vec2(cx, cy), vec2(courseW, courseH), rgb(.14,.28,.14));
             
+            // Draw gray wall border around the course (outside the green area)
+            const wallThick = WALL_THICKNESS * previewScale;
+            const wallColor = rgb(.4,.4,.45);
+            drawRectScreenSpace(vec2(cx, cy - courseH/2 - wallThick/2), vec2(courseW + wallThick*2, wallThick), wallColor);  // top
+            drawRectScreenSpace(vec2(cx, cy + courseH/2 + wallThick/2), vec2(courseW + wallThick*2, wallThick), wallColor);  // bottom
+            drawRectScreenSpace(vec2(cx - courseW/2 - wallThick/2, cy), vec2(wallThick, courseH), wallColor);  // left
+            drawRectScreenSpace(vec2(cx + courseW/2 + wallThick/2, cy), vec2(wallThick, courseH), wallColor);  // right
+            
             // Hole number
-            drawTextScreen('Hole ' + (i+1), vec2(cx, cy - courseH/2 - 20), 28, WHITE, 3, BLACK);
+            drawTextScreen('Hole ' + (i+1), vec2(cx, cy - courseH/2 - wallThick - 16), 28, WHITE, 3, BLACK);
             
             // Draw obstacles as simple shapes
             for (const o of h.obstacles)
