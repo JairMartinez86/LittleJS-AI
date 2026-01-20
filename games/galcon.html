@@ -270,6 +270,11 @@ class Fleet
         {
             planet.owner = this.owner;
             planet.ships = min(planet.capacity, -planet.ships);
+            // Reset all upgrades on capture
+            planet.upProd = 0;
+            planet.upCap = 0;
+            planet.upDef = 0;
+            recalcPlanetStats(planet);
             sfxCapture.play();
         }
     }
@@ -873,11 +878,10 @@ function drawPlanet(p)
         }
     }
 
-    // number + upgrade icons (player, neutral, and AI when debug mode enabled)
-    if (p.owner == OWNER_PLAYER || p.owner == OWNER_NEUTRAL || (p.owner == OWNER_AI && debugShowStats))
+    // number + upgrade icons (player, and AI when debug mode enabled)
+    if (p.owner == OWNER_PLAYER || (p.owner == OWNER_AI && debugShowStats))
     {
-        const textCol = p.owner == OWNER_PLAYER ? hsl(0,0,1) : 
-                       p.owner == OWNER_AI ? hsl(.02, .9, .85) : hsl(0, 0, .85);
+        const textCol = p.owner == OWNER_PLAYER ? hsl(0,0,1) : hsl(.02, .9, .85);
         
         drawText(p.ships|0, p.pos, 1.6, textCol, .18, hsl(0,0,0));
 
@@ -887,6 +891,12 @@ function drawPlanet(p)
         if (p.upDef  > 0) parts.push('🛡️' + p.upDef);
         if (parts.length)
             drawText(parts.join(' '), p.pos.add(vec2(0, -p.radius*.55)), 1.05, textCol, .18, hsl(0,0,0));
+    }
+    
+    // Show only ship count for neutral planets
+    if (p.owner == OWNER_NEUTRAL)
+    {
+        drawText(p.ships|0, p.pos, 1.6, hsl(0, 0, .85), .18, hsl(0,0,0));
     }
 }
 
