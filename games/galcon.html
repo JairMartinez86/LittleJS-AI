@@ -41,6 +41,7 @@ const OWNER_PLAYER  = 1;
 const OWNER_AI      = 2;
 
 const PANEL_WIDTH = 15;                 // world units for right panel
+const panelW = 230; // screen units for right panel
 const WORLD_SIZE = vec2(70, 40);
 const PLAY_AREA_X = WORLD_SIZE.x - PANEL_WIDTH;  // planets spawn in this width
 const PLANET_COUNT = 11;
@@ -395,17 +396,15 @@ function rotate2(v, a)
     return vec2(v.x*c - v.y*s, v.x*s + v.y*c);
 }
 
-function drawWedge(pos, dir, size, color, outlineAlpha)
+function drawWedge(pos, dir, size, color)
 {
-    if (outlineAlpha === undefined) outlineAlpha = .35;
-
     const a = Math.atan2(dir.y, dir.x);
     const tip  = rotate2(vec2(size, 0), a);
     const back = -size * .65;
     const wing = size * .55;
     const p1 = rotate2(vec2(back,  wing), a);
     const p2 = rotate2(vec2(back, -wing), a);
-    drawPoly([p1, tip, p2], color, .08, hsl(0,0,0,outlineAlpha), pos);
+    drawPoly([p1, tip, p2], color, 0, BLACK, pos);
 }
 
 // -------------------------------------------------------------
@@ -958,10 +957,9 @@ function gameInit()
 
 function createUpgradeButtons()
 {
-    const panelX = mainCanvasSize.x - 220;
-    const panelW = 240;
-    const cx = panelX + panelW/2;
-    const btnW = 200;
+    const panelX = mainCanvasSize.x - panelW;
+    const cx = panelX + panelW/2+2;
+    const btnW = 210;
     const btnH = 50;
     let y = 380;
     
@@ -1259,8 +1257,7 @@ function gameRenderPost()
     }
 
     // Right panel background (draw directly on overlay canvas)
-    const panelX = mainCanvasSize.x - 220;
-    const panelW = 240;
+    const panelX = mainCanvasSize.x - panelW;
     const panelH = mainCanvasSize.y;
     
     // Use main context for screen-space rectangles
