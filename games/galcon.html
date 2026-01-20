@@ -1013,11 +1013,12 @@ function gameUpdate()
 
     if (mouseWasPressed(0))
     {
-        if (hover && hover.owner == OWNER_PLAYER)
+        if (hover)
         {
             selectedPlanet = hover;
             sfxSelect.play();
-            dragSource = hover;
+            // Only allow drag from player planets
+            dragSource = hover.owner == OWNER_PLAYER ? hover : null;
             dragTarget = null;
 
             if (isAltDown())  dragPercent = .10;
@@ -1167,8 +1168,9 @@ function gameRenderPost()
     // Panel title
     drawTextScreen('SELECTED PLANET', vec2(panelX + panelW/2, 40), 22, hsl(.58, .7, .7), 4, hsl(0,0,0));
 
-    if (selectedPlanet && selectedPlanet.owner == OWNER_PLAYER)
+    if (selectedPlanet && selectedPlanet.owner != OWNER_AI)
     {
+        // Show info for owned and neutral planets (not enemy)
         const p = selectedPlanet;
         const cx = panelX + panelW/2;
         let y = 90;
@@ -1185,11 +1187,16 @@ function gameRenderPost()
         drawTextScreen('🛡️ Defense', vec2(cx, y), 18, hsl(.33, .7, .7), 3, hsl(0,0,0));
         drawTextScreen(((p.defChance*100)|0) + '% block', vec2(cx, y+24), 26, hsl(0,0,1), 4, hsl(0,0,0));
         
-        // Buttons are rendered by UI system
+        // Buttons are rendered by UI system (only for player planets)
+    }
+    else if (selectedPlanet && selectedPlanet.owner == OWNER_AI)
+    {
+        drawTextScreen('Enemy Planet', vec2(panelX + panelW/2, 100), 20, hsl(.02, .7, .6), 3, hsl(0,0,0));
+        drawTextScreen('Info hidden', vec2(panelX + panelW/2, 130), 18, hsl(0,0,.5), 3, hsl(0,0,0));
     }
     else
     {
-        drawTextScreen('Click a blue planet', vec2(panelX + panelW/2, 100), 18, hsl(0,0,.5), 3, hsl(0,0,0));
+        drawTextScreen('Click any planet', vec2(panelX + panelW/2, 100), 18, hsl(0,0,.5), 3, hsl(0,0,0));
         drawTextScreen('to select it', vec2(panelX + panelW/2, 124), 18, hsl(0,0,.5), 3, hsl(0,0,0));
     }
 
