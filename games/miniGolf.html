@@ -250,7 +250,6 @@ function createWall(pos, size, angle=0)
     w.color = rgb(.2,.25,.2);
     w.outlineColor = rgb(0,0,0,.5);
     w.lineWidth = .08;
-    // addBox(size, offset=vec2(), angle=0, density=0, friction=.2, restitution=0, isSensor=false)
     // higher restitution so the ball bounces more off walls
     w.addBox(size, vec2(), angle, 0, .25, .9);
     return w;
