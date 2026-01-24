@@ -246,21 +246,22 @@ class Alien extends RectObject
     constructor(pos, row)
     {
         const colors = [
-            rgb(.2,.95,.2),   // row 0 - green (top)
-            rgb(.25,.85,.95), // row 1 - cyan
+            rgb(.95,.2,.2),   // row 0 - red (top)
+            rgb(.2,.95,.2),   // row 1 - green
             rgb(.25,.85,.95), // row 2 - cyan
             rgb(.95,.4,.95),  // row 3 - magenta
-            rgb(.95,.4,.95)   // row 4 - magenta (bottom)
+            rgb(.95,.95,.2)   // row 4 - yellow (bottom)
         ];
         const base = colors[row % 5];
         super(pos, vec2(2.3, 1.6), base);
         this.row = row;
         this.renderOrder = 5;
         this.flash = 0;
+        this.animOffset = randIntInclusive(0, 15); // stagger animation per alien
     }
     render()
     {
-        const frame = (invaderAnimTick>>3) & 1;
+        const frame = ((invaderAnimTick + this.animOffset) >> 3) & 1;
         
         // Draw pixelated alien sprites based on row type
         if (this.row === 0) {
@@ -417,7 +418,7 @@ class BarrierBlock extends RectObject
 {
     constructor(pos)
     {
-        super(pos, vec2(.95,.95), rgb(.25,.95,.35));
+        super(pos, vec2(.95,.95), rgb(.95,.25,.25));
         this.renderOrder = 8;
     }
 }
@@ -503,16 +504,16 @@ function createBarriers()
         const cx = gap*i;
         const cy = barrierY;
 
-        // blocky classic shield shape (no sprites)
+        // blocky classic shield shape - arch at top
         const w = 8;
         const h = 5;
         for (let y=0; y<h; y++)
         for (let x=0; x<w; x++)
         {
-            // carve a little arch
-            const notch = (y===0 && (x===0||x===w-1)) ||
-                          (y===1 && (x===0||x===w-1)) ||
-                          (y>=3 && (x===3 || x===4) && y===h-1);
+            // carve arch at the TOP (flipped vertically)
+            const notch = (y===h-1 && (x===0||x===w-1)) ||
+                          (y===h-2 && (x===0||x===w-1)) ||
+                          (y<=1 && (x===3 || x===4) && y===0);
             if (notch) continue;
 
             const px = cx + (x - (w-1)/2)*1.0;
@@ -598,21 +599,23 @@ function gameRenderPost()
     drawTextScreen('SCORE<2>', vec2(mainCanvasSize.x - 100, hudY), 26, color);
     
     // Lives indicator with ship icons at bottom left
-    drawTextScreen(String(lives), vec2(70, mainCanvasSize.y - 40), 30, color);
+    drawTextScreen(String(lives), vec2(40, mainCanvasSize.y - 40), 30, color);
     for (let i = 0; i < lives - 1 && i < 5; i++)
     {
-        const px = 130 + i * 50;
-        const py = mainCanvasSize.y - 40;
-        // Draw mini player ships
-        drawTextScreen('▲', vec2(px, py), 28, rgb(.2,.9,.95));
+        const px = 90 + i * 45;
+        const py = mainCanvasSize.y - 42;
+        // Draw mini player ships using drawTextScreen shapes
+        const shipColor = rgb(.2,.9,.95);
+        // Simple ship representation using filled rectangles via canvas
+        mainContext.fillStyle = shipColor.toString();
+        mainContext.fillRect(px - 2, py - 8, 4, 6); // cannon
+        mainContext.fillRect(px - 12, py - 2, 24, 8); // body
+        mainContext.fillRect(px - 16, py + 2, 6, 4); // left wing
+        mainContext.fillRect(px + 10, py + 2, 6, 4); // right wing
     }
     
     // CREDIT at bottom right
     drawTextScreen(`CREDIT ${String(credit).padStart(2, '0')}`, vec2(mainCanvasSize.x - 130, mainCanvasSize.y - 40), 26, color);
-
-    // instructions
-    drawTextScreen('←/→ or A/D to move   Space/K to shoot   Enter to restart',
-        vec2(mainCanvasSize.x/2, mainCanvasSize.y-20), 20, rgb(.95,.95,.95,.6));
 
     if (gameOver)
     {
@@ -671,6 +674,20 @@ function updateInvaders()
     // lose if invaders reach the player line
     if (minY < playerY + 2.5)
         doGameOver();
+
+    // Check if aliens are touching barriers - destroy any barrier blocks they touch
+    for (const a of aliens)
+    {
+        if (a.destroyed) continue;
+        for (const br of barriers)
+        {
+            if (br.destroyed) continue;
+            if (aabbOverlap(a, br))
+            {
+                br.destroy();
+            }
+        }
+    }
 
     // invader shooting
     if (alienShootTimer > 0) alienShootTimer--;
