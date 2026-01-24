@@ -1,0 +1,680 @@
+<!DOCTYPE html><head>
+<title>LittleJS AI Starter Project</title>
+<meta charset="utf-8">
+</head><body style="background:#000">
+<script src="https://cdn.jsdelivr.net/npm/littlejsengine@1.17.15/dist/littlejs.js"></script>
+<script>
+'use strict';
+
+// engine settings, do not remove
+debugWatermark = false; // Hide debug watermark in corner
+showEngineVersion = false; // Hide engine version console display
+paused = false; // Start unpaused
+
+// engine settings, customize if necessary
+gravity = vec2(0, 0); // No gravity by default
+cameraPos = vec2(0, 0); // Camera centered at origin
+cameraScale = 32; // Zoomed OUT (smaller shows more world)
+
+// AI can use this class to make sound effects
+class SoundGenerator extends Sound 
+{
+    constructor(params = {})
+    {
+        const {
+            volume = 1,
+            randomness = .05,
+            frequency = 220,
+            attack = 0,
+            release = .1,
+            shapeCurve = 1,
+            slide = 0,
+            pitchJump = 0,
+            pitchJumpTime = 0,
+            repeatTime = 0,
+            noise = 0,
+            bitCrush = 0,
+            delay = 0,
+        } = params;
+        super([volume, randomness, frequency, attack, 0, release, 0, shapeCurve, slide, 0, pitchJump, pitchJumpTime, repeatTime, noise, 0, bitCrush, delay, 1, 0, 0, 0]);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Spy-Hunter-ish: top down endless road, traffic vs bad cars, shooting.
+
+// Road layout
+const LANES = 3;
+const LANE_SPACING = 3.4;
+const ROAD_SHOULDER = 2.4;
+const ROAD_WIDTH = (LANES-1)*LANE_SPACING + ROAD_SHOULDER*2 + 2.2;
+const ROAD_HALF = ROAD_WIDTH/2;
+
+// Gameplay
+const PLAYER_MIN_SPEED = 8;
+const PLAYER_MAX_SPEED = 24;
+const PLAYER_ACCEL = 18;
+const PLAYER_FRICTION = 14;
+const PLAYER_STRAFE = 18;
+const BULLET_SPEED = 30;
+
+const BAD_CAR_CHANCE = .34;        // percent of spawned cars that are hostile
+const CIVILIAN_PENALTY = 35;       // score penalty for shooting a civilian
+const CAMERA_LOOKAHEAD = 3.0;      // put player closer to center
+
+let player;
+let bullets = [];
+let cars = [];     // traffic + bad cars
+let props = [];    // roadside objects
+
+let score = 0;
+let distance = 0;
+let gameOver = false;
+
+let carSpawnTimer = new Timer();
+let propSpawnTimer = new Timer();
+
+// Sounds
+const sndShoot = new SoundGenerator({volume:.30, frequency:520, attack:0, release:.07, shapeCurve:1.6, slide:-1.2, noise:.02});
+const sndHitBad = new SoundGenerator({volume:.55, frequency:180, attack:0, release:.14, shapeCurve:.55, slide:-.6, noise:.25, delay:.015});
+const sndHitCiv = new SoundGenerator({volume:.35, frequency:240, attack:0, release:.12, shapeCurve:1.2, slide:-.2, noise:.12, delay:0});
+const sndBoom  = new SoundGenerator({volume:.65, frequency:95,  attack:0, release:.28, shapeCurve:.25, slide:-.9, noise:.32, delay:.02});
+
+function laneX(i)
+{
+    return (i - (LANES-1)/2) * LANE_SPACING;
+}
+
+function clampToRoad(x, halfSizeX)
+{
+    const minX = -ROAD_HALF + halfSizeX;
+    const maxX =  ROAD_HALF - halfSizeX;
+    return clamp(x, minX, maxX);
+}
+
+function overlapAABB(a, b)
+{
+    return isOverlapping(a.pos, a.size, b.pos, b.size);
+}
+
+// More controlled explosion: small sparks + smoke, no massive additive yellow.
+function explodeCar(pos, big=false)
+{
+    const sparkA = rgb(1,.65,.15,.9);
+    const sparkB = rgb(1,.35,.05,.85);
+    const sparkEnd = rgb(.2,.05,.02,0);
+
+    const smokeA = rgb(.20,.20,.22,.55);
+    const smokeB = rgb(.12,.12,.14,.45);
+    const smokeEnd = rgb(.08,.08,.09,0);
+
+    const rateScale = big ? 1.25 : 1;
+    const sizeScale = big ? 1.15 : 1;
+
+    // sparks (short, punchy)
+    new ParticleEmitter(
+        pos, 0,
+        vec2(0), .045, 90*rateScale, PI,
+        undefined,
+        sparkA, sparkB,
+        sparkEnd, sparkEnd,
+        .22, .22*sizeScale, .05, 12, 14,
+        .90, .92, 0, PI,
+        .12, .6, false, false
+    );
+
+    // smoke (slower, larger, non-additive)
+    new ParticleEmitter(
+        pos, 0,
+        vec2(.2), .08, 38*rateScale, PI,
+        undefined,
+        smokeA, smokeB,
+        smokeEnd, smokeEnd,
+        .65, .55*sizeScale, .95*sizeScale, 4.2, 4,
+        .95, .98, 0, PI,
+        .04, .45, false, false
+    );
+}
+
+// Unified vehicle renderer (adds 4 wheels as side rectangles)
+function renderVehicle(pos, size, bodyColor, isBad=false, isPlayer=false)
+{
+    const wheelColor = rgb(.06,.06,.07);
+    const trimColor  = isPlayer ? rgb(.08,.2,.35) : rgb(.12,.12,.14);
+
+    // wheels (4) on the sides
+    const wheelW = max(.22, size.x * .22);
+    const wheelH = max(.34, size.y * .18);
+    const xOff   = size.x/2 + wheelW/2 - .06;
+    const yF     = size.y * .27;
+    const yB     = -size.y * .27;
+
+    // left wheels
+    drawRect(pos.add(vec2(-xOff, yF)), vec2(wheelW, wheelH), wheelColor);
+    drawRect(pos.add(vec2(-xOff, yB)), vec2(wheelW, wheelH), wheelColor);
+    // right wheels
+    drawRect(pos.add(vec2( xOff, yF)), vec2(wheelW, wheelH), wheelColor);
+    drawRect(pos.add(vec2( xOff, yB)), vec2(wheelW, wheelH), wheelColor);
+
+    // body
+    drawRect(pos, size, bodyColor);
+
+    // windshield
+    drawRect(pos.add(vec2(0, .65)), vec2(size.x*.66, size.y*.22), rgb(.78,.88,1));
+
+    // bumper/trim
+    drawRect(pos.add(vec2(0, -1.15)), vec2(size.x*.75, .22), trimColor);
+
+    if (isBad)
+    {
+        // hostile stripe
+        drawRect(pos.add(vec2(0, .05)), vec2(size.x*.85, .22), rgb(.18,.02,.02,.9));
+    }
+
+    if (isPlayer)
+    {
+        // twin guns
+        drawRect(pos.add(vec2(-.55, .1)), vec2(.18, .5), trimColor);
+        drawRect(pos.add(vec2( .55, .1)), vec2(.18, .5), trimColor);
+
+        // subtle center stripe
+        drawRect(pos.add(vec2(0, .2)), vec2(.14, size.y*.65), rgb(1,1,1,.16));
+    }
+
+    // tail lights
+    drawRect(pos.add(vec2(-.4, -1.1)), vec2(.25,.18), rgb(1,.2,.2));
+    drawRect(pos.add(vec2( .4, -1.1)), vec2(.25,.18), rgb(1,.2,.2));
+
+    if (!isBad && !isPlayer)
+    {
+        // civilian roof highlight
+        drawRect(pos.add(vec2(0, .95)), vec2(size.x*.6, .16), rgb(1,1,1,.2));
+    }
+}
+
+class Bullet extends EngineObject
+{
+    constructor(pos, vel)
+    {
+        super(pos, vec2(.20, .65));
+        this.vel = vel;
+        this.life = new Timer(1.3);
+        this.renderOrder = 6;
+    }
+    update()
+    {
+        this.pos = this.pos.add(this.vel.scale(timeDelta));
+        if (this.life.elapsed() || this.pos.y > cameraPos.y + 50)
+            this.destroy();
+    }
+    render()
+    {
+        drawRect(this.pos, this.size, rgb(1,1,.2));
+    }
+}
+
+class RoadsideProp extends EngineObject
+{
+    constructor(pos, kind)
+    {
+        super(pos, vec2(1,1));
+        this.kind = kind;
+        this.renderOrder = 1;
+
+        // vary size by kind
+        if (kind == 0) this.size = vec2(1.2, 2.2);      // sign
+        if (kind == 1) this.size = vec2(1.3, 2.8);      // tree
+        if (kind == 2) this.size = vec2(.8, 1.6);       // post
+        if (kind == 3) this.size = vec2(1.7, 2.0);      // billboard
+
+        this.flip = randBool();
+    }
+    update()
+    {
+        if (this.pos.y < cameraPos.y - 40)
+            this.destroy();
+    }
+    render()
+    {
+        const x = this.pos.x;
+        const y = this.pos.y;
+
+        // a little shadow
+        drawRect(vec2(x, y- this.size.y/2 + .15), vec2(this.size.x*1.1, .25), rgb(0,0,0,.25));
+
+        if (this.kind == 0)
+        {
+            // road sign
+            drawRect(vec2(x, y - .7), vec2(.18, 1.2), rgb(.35,.30,.22));
+            drawRect(vec2(x, y + .25), vec2(1.2, .7), rgb(.85,.85,.9));
+            drawRect(vec2(x, y + .25), vec2(1.05, .55), rgb(.15,.25,.85,.95));
+        }
+        else if (this.kind == 1)
+        {
+            // tree: trunk + canopy (rect-y so no reliance on circle signature)
+            drawRect(vec2(x, y - .55), vec2(.3, 1.0), rgb(.32,.22,.15));
+            drawRect(vec2(x, y + .55), vec2(1.25, 1.15), rgb(.08,.35,.12));
+            drawRect(vec2(x + (this.flip?-.35:.35), y + .85), vec2(.85, .75), rgb(.06,.28,.10));
+        }
+        else if (this.kind == 2)
+        {
+            // reflector post
+            drawRect(vec2(x, y - .2), vec2(.22, 1.3), rgb(.75,.75,.75));
+            drawRect(vec2(x, y + .55), vec2(.28, .18), rgb(1,.25,.25));
+        }
+        else
+        {
+            // billboard
+            drawRect(vec2(x, y - .6), vec2(.22, 1.1), rgb(.30,.22,.15));
+            drawRect(vec2(x, y + .35), vec2(1.7, .9), rgb(.12,.12,.14));
+            drawRect(vec2(x, y + .35), vec2(1.45, .65), rgb(.95,.75,.1,.9));
+        }
+    }
+}
+
+class Car extends EngineObject
+{
+    constructor(pos, speed, isBad)
+    {
+        super(pos, vec2(1.45, 2.8));
+        this.speed = speed;
+        this.isBad = isBad;
+        this.hp = isBad ? 2 : 1;
+
+        // Spy Hunter feel: bad cars are red; civilians mostly blue/gray
+        if (isBad)
+            this.color = rgb(.95,.18,.18);
+        else
+        {
+            const pick = randInt(4);
+            this.color = pick == 0 ? rgb(.25,.55,1) :
+                         pick == 1 ? rgb(.55,.62,.7) :
+                         pick == 2 ? rgb(.2,.8,.65) :
+                                     rgb(.7,.7,.75);
+        }
+
+        this.turnTimer = new Timer(rand(isBad?.45:.85, isBad?1.1:1.8));
+        this.targetLane = randInt(LANES);
+        this.renderOrder = 3;
+
+        // bad cars “hunt” the player more
+        this.aggression = isBad ? rand(.35, .75) : rand(.05, .25);
+    }
+
+    update()
+    {
+        // move forward
+        this.pos.y += this.speed * timeDelta;
+
+        // lane decisions
+        if (this.turnTimer.elapsed())
+        {
+            this.turnTimer.set(rand(this.isBad?.45:.85, this.isBad?1.1:1.8));
+
+            if (player && randBool(this.aggression))
+            {
+                const playerLane = clamp(Math.round((player.pos.x / LANE_SPACING) + (LANES-1)/2), 0, LANES-1);
+                // bad cars bias harder towards player; civilians drift near, but less so
+                const drift = this.isBad ? (randInt(3)-1) : (randBool(.7)?0:(randInt(3)-1));
+                this.targetLane = clamp(playerLane + drift, 0, LANES-1);
+            }
+            else
+                this.targetLane = randInt(LANES);
+        }
+
+        // steer towards lane
+        const targetX = laneX(this.targetLane);
+        const steer = this.isBad ? .11 : .07;
+        this.pos.x = lerp(this.pos.x, targetX, steer);
+        this.pos.x = clampToRoad(this.pos.x, this.size.x/2);
+
+        if (this.pos.y < cameraPos.y - 45)
+            this.destroy();
+    }
+
+    render()
+    {
+        renderVehicle(this.pos, this.size, this.color, this.isBad, false);
+    }
+}
+
+class PlayerCar extends EngineObject
+{
+    constructor()
+    {
+        super(vec2(0, 0), vec2(1.55, 3.0));
+        this.speed = 14;
+        this.velX = 0;
+        this.fireCooldown = new Timer();
+        this.lives = 3;
+        this.invuln = new Timer();
+        this.renderOrder = 4;
+
+        // closer to the center of the view
+        this.pos = vec2(0, -2);
+    }
+
+    update()
+    {
+        // accelerate / brake
+        const accel = (keyIsDown('ArrowUp') || keyIsDown('KeyW')) ? 1 : 0;
+        const brake = (keyIsDown('ArrowDown') || keyIsDown('KeyS')) ? 1 : 0;
+        this.speed += (accel - brake) * PLAYER_ACCEL * timeDelta;
+
+        // gentle pull to cruising speed
+        const cruise = 14;
+        this.speed = lerp(this.speed, cruise, PLAYER_FRICTION * timeDelta * .02);
+        this.speed = clamp(this.speed, PLAYER_MIN_SPEED, PLAYER_MAX_SPEED);
+
+        // forward
+        this.pos.y += this.speed * timeDelta;
+
+        // strafe
+        const left  = (keyIsDown('ArrowLeft') || keyIsDown('KeyA')) ? 1 : 0;
+        const right = (keyIsDown('ArrowRight') || keyIsDown('KeyD')) ? 1 : 0;
+        const input = right - left;
+        this.velX = lerp(this.velX, input * PLAYER_STRAFE, .22);
+        this.pos.x += this.velX * timeDelta;
+        this.pos.x = clampToRoad(this.pos.x, this.size.x/2);
+
+        // shooting (hold Space or hold Left Mouse)
+        const wantFire = (keyIsDown('Space') || mouseIsDown(0));
+        if (wantFire && !this.fireCooldown.active() && !gameOver)
+        {
+            this.fireCooldown.set(.095);
+
+            // Double shot from twin guns near the front/top of the car
+            const muzzleY = this.size.y/2 + .25;
+            const muzzleX = .55;
+            const bVel = vec2(0, BULLET_SPEED + this.speed);
+
+            bullets.push(
+                new Bullet(this.pos.add(vec2(-muzzleX, muzzleY)), bVel),
+                new Bullet(this.pos.add(vec2( muzzleX, muzzleY)), bVel),
+            );
+
+            sndShoot.play(this.pos, 1, 1.08);
+        }
+
+        // edge scrub
+        const edge = ROAD_HALF - this.size.x/2;
+        if (abs(this.pos.x) > edge - .05)
+            this.speed = max(PLAYER_MIN_SPEED, this.speed - 10 * timeDelta);
+    }
+
+    render()
+    {
+        // invuln blink
+        if (this.invuln.active() && ((time*10|0)%2))
+            drawRect(this.pos, this.size.add(vec2(.35)), rgb(1,1,1,.22));
+
+        renderVehicle(this.pos, this.size, rgb(.25,.75,1), false, true);
+    }
+}
+
+function resetGame()
+{
+    engineObjectsDestroy();
+    bullets.length = 0;
+    cars.length = 0;
+    props.length = 0;
+
+    score = 0;
+    distance = 0;
+    gameOver = false;
+
+    carSpawnTimer.unset();
+    propSpawnTimer.unset();
+
+    player = new PlayerCar();
+
+    // Seed some traffic + props immediately so the road isn't empty
+    for (let i=0; i<4; i++) spawnCar();
+    for (let i=0; i<4; i++) spawnProp();
+}
+
+function spawnCar()
+{
+    if (!player) return;
+
+    // spawn within/near view so you see traffic quickly
+    const y = player.pos.y + rand(14, 26);
+
+    const lane = randInt(LANES);
+    const x = laneX(lane) + rand(-.25, .25);
+
+    const d = min(distance / 1400, 1);
+
+    // bad cars are rarer early
+    const isBad = randBool(lerp(BAD_CAR_CHANCE, BAD_CAR_CHANCE+.14, d));
+
+    // Traffic is mostly slower than the player so speed changes matter.
+    // Bad cars can be fast enough to keep up or pressure you.
+    const civBase = lerp(5.5, 8.0, d);
+    const civVar  = 3.5;
+    const badBase = lerp(8.0, 11.5, d);
+    const badVar  = 4.0;
+
+    const speed = (isBad ? badBase : civBase) + rand(-(isBad?badVar:civVar), (isBad?badVar:civVar));
+
+    const c = new Car(vec2(x, y), max(3.5, speed), isBad);
+    cars.push(c);
+}
+
+function spawnProp()
+{
+    if (!player) return;
+
+    const y = player.pos.y + rand(35, 75);
+    const side = randBool() ? -1 : 1;
+    const x = side * (ROAD_HALF + rand(2.0, 6.5));
+
+    // pick prop kind
+    const kind = randInt(4);
+    const p = new RoadsideProp(vec2(x, y), kind);
+    props.push(p);
+}
+
+function runSanityTests()
+{
+    ASSERT(isVector2(vec2(1,2)), 'vec2 should return a Vector2');
+    ASSERT(clamp(5, 0, 3) === 3, 'clamp should clamp high');
+    ASSERT(clamp(-1, 0, 3) === 0, 'clamp should clamp low');
+    ASSERT(laneX(1) === 0, 'middle lane should be x=0 for 3 lanes');
+    ASSERT(typeof drawRect === 'function', 'drawRect should exist');
+    ASSERT(typeof ParticleEmitter === 'function', 'ParticleEmitter should exist');
+    // distribution sanity (non-deterministic but should not be extreme)
+    let badCount = 0;
+    for (let i=0;i<200;i++) if (randBool(BAD_CAR_CHANCE)) badCount++;
+    ASSERT(badCount > 30 && badCount < 110, 'bad car chance seems off');
+}
+
+///////////////////////////////////////////////////////////////////////////////
+async function gameInit()
+{
+    setCanvasFixedSize(vec2(1280, 720));
+    runSanityTests();
+    resetGame();
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameUpdate()
+{
+    if (keyWasPressed('KeyR'))
+        resetGame();
+
+    if (!player || gameOver)
+        return;
+
+    distance += player.speed * timeDelta;
+    score += player.speed * timeDelta * .45;
+
+    // spawn cars (a lot less vehicles, but always some visible)
+    if (!carSpawnTimer.active())
+    {
+        const d = min(distance / 1200, 1);
+        const interval = lerp(2.35, 1.75, d);
+        carSpawnTimer.set(interval);
+
+        // hard cap on cars to keep things readable
+        if (cars.length < 6)
+            spawnCar();
+
+        // rare extra car
+        if (cars.length < 6 && randBool(lerp(.01, .03, d)))
+            spawnCar();
+    }
+
+    // spawn roadside props
+    if (!propSpawnTimer.active())
+    {
+        propSpawnTimer.set(rand(.28, .55));
+        spawnProp();
+        if (randBool(.25)) spawnProp();
+    }
+
+    // bullets vs cars
+    for (const b of bullets)
+    {
+        if (b.destroyed) continue;
+        for (const c of cars)
+        {
+            if (c.destroyed) continue;
+            if (!overlapAABB(b, c)) continue;
+
+            b.destroy();
+
+            // Everyone can be destroyed; civilians cost points.
+            c.hp--;
+
+            if (c.isBad)
+            {
+                sndHitBad.play(c.pos, 1, rand(.9, 1.1));
+                explodeCar(c.pos, false);
+
+                if (c.hp <= 0)
+                {
+                    c.destroy();
+                    sndBoom.play(c.pos, 1, rand(.95, 1.05));
+                    explodeCar(c.pos, true);
+                    score += 80;
+                }
+            }
+            else
+            {
+                // civilian hit/kill: smaller boom + penalty
+                sndHitCiv.play(c.pos, 1, rand(.95, 1.05));
+                explodeCar(c.pos, false);
+
+                if (c.hp <= 0)
+                {
+                    c.destroy();
+                    // don't reward, just penalize
+                    score = max(0, score - CIVILIAN_PENALTY);
+                }
+            }
+
+            break;
+        }
+    }
+
+    // player vs cars
+    if (!player.invuln.active())
+    {
+        for (const c of cars)
+        {
+            if (c.destroyed) continue;
+            if (!overlapAABB(player, c)) continue;
+
+            c.destroy();
+            sndBoom.play(player.pos, 1, .9);
+            explodeCar(player.pos, true);
+
+            player.lives--;
+            player.invuln.set(1.1);
+            player.speed = max(PLAYER_MIN_SPEED, player.speed - 7);
+
+            if (player.lives <= 0)
+                gameOver = true;
+            break;
+        }
+    }
+
+    bullets = bullets.filter(o=>!o.destroyed);
+    cars = cars.filter(o=>!o.destroyed);
+    props = props.filter(o=>!o.destroyed);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameUpdatePost()
+{
+    cameraPos = vec2(0, player ? player.pos.y + CAMERA_LOOKAHEAD : 0);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameRender()
+{
+    const camSize = getCameraSize();
+
+    // grass
+    drawRect(cameraPos, camSize, rgb(.05,.25,.07));
+
+    // roadside darker strip
+    drawRect(cameraPos.add(vec2(-ROAD_HALF-4.4, 0)), vec2(4.0, camSize.y), rgb(.03,.18,.05));
+    drawRect(cameraPos.add(vec2( ROAD_HALF+4.4, 0)), vec2(4.0, camSize.y), rgb(.03,.18,.05));
+
+    // road base (lighter so black wheels read better)
+    drawRect(cameraPos, vec2(ROAD_WIDTH, camSize.y), rgb(.16,.16,.17));
+
+    // subtle center highlight (draw BEFORE dashes so lines remain visible)
+    drawRect(cameraPos, vec2(ROAD_WIDTH*.92, camSize.y), rgb(.10,.10,.12,.30));
+
+    // shoulders
+    drawRect(cameraPos.add(vec2(-ROAD_HALF + .60, 0)), vec2(1.2, camSize.y), rgb(.16,.16,.17));
+    drawRect(cameraPos.add(vec2( ROAD_HALF - .60, 0)), vec2(1.2, camSize.y), rgb(.16,.16,.17));
+
+    // road markings (tie to player movement so speed changes feel right)
+    const startY = cameraPos.y - camSize.y/2 - 6;
+    const endY   = cameraPos.y + camSize.y/2 + 6;
+
+    // ONLY ONE divider line: center dotted line
+    // Use player position for scroll so accelerating/braking changes flow naturally.
+    const scroll = player ? player.pos.y : 0;
+
+    {
+        const x = 0;
+        const dashH = 1.6;
+        const gapH  = 1.4;
+        for (let y = startY; y < endY; y += dashH + gapH)
+        {
+            const yy = y - mod(scroll, dashH + gapH);
+            drawRect(vec2(x, yy + dashH/2), vec2(.32, dashH), rgb(1,1,1));
+        }
+    }
+
+    // subtle center highlight already drawn above
+
+    // starting hint
+    if (distance < 40 && !gameOver)
+        drawText('Shoot RED cars only', cameraPos.add(vec2(0, -camSize.y*.33)), 1.1, rgb(1,1,1), .15, rgb(0,0,0));
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameRenderPost()
+{
+    const spd = player ? player.speed.toFixed(0) : '0';
+    const lives = player ? player.lives : 0;
+    const hud = `SCORE ${score|0}   SPEED ${spd}   LIVES ${lives}`;
+    drawTextScreen(hud, vec2(mainCanvasSize.x/2, 32), 36, hsl(0,0,1), 4, hsl(0,0,0));
+
+    if (gameOver)
+    {
+        drawTextScreen('GAME OVER', vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 - 40), 120, hsl(0,1,.6), 8, hsl(0,0,0));
+        drawTextScreen('Press R to restart', vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 + 50), 60, hsl(0,0,1), 6, hsl(0,0,0));
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+engineInit(gameInit, gameUpdate, gameUpdatePost, gameRender, gameRenderPost);
+
+</script>
