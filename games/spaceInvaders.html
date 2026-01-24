@@ -88,9 +88,6 @@ let ufoSpawnTimer = 0;
 let marchTimer = 0;
 let marchBeat = 0;
 
-let stars = [];
-let credit = 0;
-
 // Sounds
 const sfxShoot    = new SoundGenerator({volume:.22, frequency:520, release:.02, shapeCurve:.4, noise:.15});
 const sfxExplode  = new SoundGenerator({volume:.35, frequency:120, release:.22, noise:.2, shapeCurve:1.6, slide:-.4});
@@ -125,11 +122,6 @@ function randIntInclusive(a, b)
     return (rand(a, b+1) | 0);
 }
 
-function setRandomAlienShootTimer()
-{
-    alienShootTimer = randIntInclusive(alienShootMin, alienShootMax);
-}
-
 function createExplosion(pos, color, count = 10)
 {
     // Simple particle explosion using LittleJS ParticleEmitter
@@ -147,6 +139,40 @@ function createExplosion(pos, color, count = 10)
         0,                          // gravityScale
         PI, .1, 1                   // cone, fadeRate, randomness
     );
+}
+
+function goToTitleScreen()
+{
+    // Clean up all game objects
+    engineObjectsDestroy(true);
+    aliens.length = 0;
+    bullets.length = 0;
+    bombs.length = 0;
+    barriers.length = 0;
+    ufo = null;
+    player = null;
+    levelAnnounce = 0;
+    respawnTimer = 0;
+    playerHidden = false;
+    gameOverTimer = 0;
+    initTitleScreen();
+}
+
+function resetInvaderState()
+{
+    // Reset invader movement
+    invaderDir = 1;
+    invaderSpeed = .06 + (currentLevel - 1) * .01;
+    
+    // Reset shooting timers
+    const levelShootBonus = (currentLevel - 1) * 2;
+    alienShootMin = max(3, 6 - levelShootBonus);
+    alienShootMax = max(10, 20 - levelShootBonus * 2);
+    alienShootTimer = 60; // 1 second delay before enemies shoot
+    
+    // Reset march
+    marchTimer = 40;
+    marchBeat = 0;
 }
 
 function resetGame()
@@ -186,22 +212,11 @@ function startLevel()
     for (const br of barriers) br.destroy();
     barriers.length = 0;
 
-    invaderDir = 1;
-    // Base speed increases with level
-    const baseSpeed = .06 + (currentLevel - 1) * .01;
-    invaderSpeed = baseSpeed;
     invaderDrop = 1.0;
     invaderAnimTick = 0;
-
-    // Shooting gets faster each level
-    const levelShootBonus = (currentLevel - 1) * 2;
-    alienShootMin = max(3, 6 - levelShootBonus);
-    alienShootMax = max(10, 20 - levelShootBonus * 2);
-    alienShootTimer = 60; // 1 second delay before enemies start shooting
+    resetInvaderState();
     
     ufoSpawnTimer = randIntInclusive(300, 600);
-    marchTimer = 40;
-    marchBeat = 0;
 
     if (!player || player.destroyed)
         player = new Player(vec2(levelSize.x/2, playerY));
@@ -591,9 +606,6 @@ function gameInit()
     setCanvasFixedSize(vec2(960, 540));
     setCameraPos(levelSize.scale(.5));
     cameraScale = 16; // pixels per world unit
-
-    // No starfield for classic look
-    stars = [];
     
     // Initialize title screen aliens
     initTitleScreen();
@@ -647,42 +659,19 @@ function gameUpdate()
         return;
     }
     
-    // restart (Enter or Click) - game over goes to title, win restarts
+    // Game over - click to return to title (after delay)
     if (gameOver && gameOverTimer <= 0 && (keyWasPressed('Enter') || mouseWasPressed(0)))
     {
-        // Go to title screen
-        engineObjectsDestroy(true);
-        aliens.length = 0;
-        bullets.length = 0;
-        bombs.length = 0;
-        barriers.length = 0;
-        ufo = null;
-        player = null;
-        levelAnnounce = 0;
-        respawnTimer = 0;
-        playerHidden = false;
-        gameOverTimer = 0;
-        initTitleScreen();
+        goToTitleScreen();
         return;
     }
     if (gameWin && (keyWasPressed('Enter') || mouseWasPressed(0)))
         resetGame();
     
-    // Return to title screen with Escape (works anytime including during level announcement)
+    // Return to title screen with Escape
     if (keyWasPressed('Escape'))
     {
-        // Clean up game objects
-        engineObjectsDestroy(true);
-        aliens.length = 0;
-        bullets.length = 0;
-        bombs.length = 0;
-        barriers.length = 0;
-        ufo = null;
-        player = null;
-        levelAnnounce = 0;
-        respawnTimer = 0;
-        playerHidden = false;
-        initTitleScreen();
+        goToTitleScreen();
         return;
     }
     
@@ -835,8 +824,8 @@ function renderTitleScreen()
     // Stars (drawn on top since aliens render via engine)
     for (let i = 0; i < 80; i++)
     {
-        const sx = (i * 127 + titleTimer * (0.2 + (i % 3) * 0.1)) % w;
-        const sy = (i * 83) % h;
+        const sx = (i ** 3 * 127.3 + titleTimer * (0.2 + (i % 3) * 0.1)) % w;
+        const sy = (i * 83.3) % h;
         const brightness = 0.3 + 0.7 * ((i * 37) % 100) / 100;
         ctx.fillStyle = `rgba(255,255,255,${brightness})`;
         ctx.fillRect(sx, sy, 2, 2);
@@ -1183,19 +1172,7 @@ function doRespawn()
             a.pos = a.originalPos.copy();
     }
     
-    // Reset invader movement state but DON'T respawn them
-    invaderDir = 1;
-    const baseSpeed = .06 + (currentLevel - 1) * .01;
-    invaderSpeed = baseSpeed;
-    
-    // Reset shooting timers with 1 second delay
-    const levelShootBonus = (currentLevel - 1) * 2;
-    alienShootMin = max(3, 6 - levelShootBonus);
-    alienShootMax = max(10, 20 - levelShootBonus * 2);
-    alienShootTimer = 60; // 1 second delay before enemies shoot again
-    
-    marchTimer = 40;
-    marchBeat = 0;
+    resetInvaderState();
     
     // Respawn player at center
     player.pos = vec2(levelSize.x/2, playerY);
