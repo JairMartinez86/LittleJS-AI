@@ -56,10 +56,12 @@ let aliens = [];
 let bullets = [];
 let bombs = [];
 let barriers = [];
+let ufo = null;
 
 let score = 0;
 let hiScore = 0;
 let lives = 3;
+let nextBonusLife = 1500;
 
 let gameOver = false;
 let gameWin = false;
@@ -73,6 +75,10 @@ let alienShootTimer = 0;
 let alienShootMin = 18;         // frames
 let alienShootMax = 55;         // frames
 
+let ufoSpawnTimer = 0;
+let marchTimer = 0;
+let marchBeat = 0;
+
 let stars = [];
 let credit = 0;
 
@@ -81,6 +87,13 @@ const sfxShoot    = new SoundGenerator({volume:.35, frequency:700, release:.07, 
 const sfxExplode  = new SoundGenerator({volume:.35, frequency:120, release:.22, noise:.2, shapeCurve:1.6, slide:-.4});
 const sfxHit      = new SoundGenerator({volume:.28, frequency:280, release:.08, shapeCurve:1.2});
 const sfxLoseLife = new SoundGenerator({volume:.40, frequency:180, release:.25, shapeCurve:1.8, slide:-.2});
+const sfxUFO      = new SoundGenerator({volume:.25, frequency:240, release:.15, shapeCurve:.8});
+const sfxBonusLife = new SoundGenerator({volume:.45, frequency:440, release:.35, shapeCurve:.5, pitchJump:220, pitchJumpTime:.1});
+// Marching sounds - 4 alternating notes
+const sfxMarch1   = new SoundGenerator({volume:.20, frequency:200, release:.05, shapeCurve:1.5});
+const sfxMarch2   = new SoundGenerator({volume:.20, frequency:180, release:.05, shapeCurve:1.5});
+const sfxMarch3   = new SoundGenerator({volume:.20, frequency:160, release:.05, shapeCurve:1.5});
+const sfxMarch4   = new SoundGenerator({volume:.20, frequency:140, release:.05, shapeCurve:1.5});
 
 // ------------------------------------------------------------
 // Helpers
@@ -107,6 +120,25 @@ function setRandomAlienShootTimer()
     alienShootTimer = randIntInclusive(alienShootMin, alienShootMax);
 }
 
+function createExplosion(pos, color)
+{
+    // Simple particle explosion using LittleJS ParticleEmitter
+    new ParticleEmitter(
+        pos, 0,                     // pos, angle
+        vec2(0.5),                  // emitSize
+        .1, 100,                    // emitTime, emitRate
+        PI*2,                       // emitConeAngle
+        undefined,                  // tileInfo
+        color, color,               // colorStartA, colorStartB
+        color.scale(1,0), color.scale(1,0), // colorEndA, colorEndB
+        .3, .4, .1,                 // particleTime, sizeStart, sizeEnd
+        .5, 0,                      // speed, angleSpeed
+        .95, 1,                     // damping, angleDamping
+        0,                          // gravityScale
+        PI, .1, 1                   // cone, fadeRate, randomness
+    );
+}
+
 function resetGame()
 {
     // clear objects
@@ -116,9 +148,11 @@ function resetGame()
     bullets.length = 0;
     bombs.length = 0;
     barriers.length = 0;
+    ufo = null;
 
     score = 0;
     lives = 3;
+    nextBonusLife = 1500;
     gameOver = false;
     gameWin = false;
 
@@ -130,6 +164,10 @@ function resetGame()
     alienShootMin = 18;
     alienShootMax = 55;
     setRandomAlienShootTimer();
+    
+    ufoSpawnTimer = randIntInclusive(300, 600);
+    marchTimer = 40;
+    marchBeat = 0;
 
     player = new Player(vec2(levelSize.x/2, playerY));
     createBarriers();
@@ -377,6 +415,58 @@ class BarrierBlock extends RectObject
     }
 }
 
+class UFO extends RectObject
+{
+    constructor()
+    {
+        const dir = rand() < .5 ? 1 : -1;
+        const startX = dir > 0 ? -3 : levelSize.x + 3;
+        super(vec2(startX, levelSize.y - 2), vec2(3, 1.4), rgb(.95,.25,.25));
+        this.velocity = vec2(dir * .08, 0);
+        this.renderOrder = 15;
+        this.pointValue = [50, 100, 150, 300][randIntInclusive(0, 3)];
+        this.showPoints = 0;
+    }
+    
+    update()
+    {
+        if (this.showPoints > 0)
+        {
+            this.showPoints--;
+            if (this.showPoints === 0)
+                this.destroy();
+            return;
+        }
+        
+        this.pos = this.pos.add(this.velocity);
+        
+        if (this.pos.x < -5 || this.pos.x > levelSize.x + 5)
+            this.destroy();
+    }
+    
+    render()
+    {
+        if (this.showPoints > 0)
+        {
+            // Show point value instead of UFO
+            drawText(String(this.pointValue), this.pos, .8, rgb(.95,.25,.25));
+            return;
+        }
+        
+        const p = this.pos;
+        const s = .22;
+        
+        // Classic UFO sprite
+        drawRect(p.add(vec2(0,.3)), vec2(s*6, s), this.color);
+        drawRect(p, vec2(s*10, s*2), this.color);
+        drawRect(p.add(vec2(0,-.3)), vec2(s*6, s), this.color);
+        // Windows
+        drawRect(p.add(vec2(-.6,.1)), vec2(s,s), rgb(0,0,0));
+        drawRect(p.add(vec2(0,.1)), vec2(s,s), rgb(0,0,0));
+        drawRect(p.add(vec2(.6,.1)), vec2(s,s), rgb(0,0,0));
+    }
+}
+
 // ------------------------------------------------------------
 // Level creation
 
@@ -453,8 +543,10 @@ function gameUpdate()
         return;
 
     updateInvaders();
+    updateUFO();
     updateCollisions();
     cleanupArrays();
+    updateMarchingSound();
 
     // win condition
     if (!aliens.length)
@@ -582,6 +674,41 @@ function updateInvaders()
     }
 }
 
+function updateUFO()
+{
+    // Spawn UFO randomly
+    if (!ufo || ufo.destroyed)
+    {
+        ufoSpawnTimer--;
+        if (ufoSpawnTimer <= 0)
+        {
+            ufo = new UFO();
+            ufoSpawnTimer = randIntInclusive(600, 1200); // 10-20 seconds
+            sfxUFO.play(ufo.pos);
+        }
+    }
+}
+
+function updateMarchingSound()
+{
+    if (!aliens.length) return;
+    
+    // Speed up marching based on number of aliens left
+    const aliveCount = aliens.length;
+    const maxDelay = 40;
+    const minDelay = 8;
+    const delay = max(minDelay, maxDelay - (55 - aliveCount));
+    
+    marchTimer--;
+    if (marchTimer <= 0)
+    {
+        marchTimer = delay;
+        const sounds = [sfxMarch1, sfxMarch2, sfxMarch3, sfxMarch4];
+        sounds[marchBeat % 4].play();
+        marchBeat++;
+    }
+}
+
 function alienFire()
 {
     if (!aliens.length)
@@ -611,10 +738,24 @@ function alienFire()
 
 function updateCollisions()
 {
-    // bullets vs aliens/barriers
+    // bullets vs aliens/barriers/UFO
     for (const b of bullets)
     {
         if (b.destroyed) continue;
+
+        // vs UFO
+        if (ufo && !ufo.destroyed && !ufo.showPoints && aabbOverlap(b, ufo))
+        {
+            b.destroy();
+            score += ufo.pointValue;
+            hiScore = max(hiScore, score);
+            checkBonusLife();
+            createExplosion(ufo.pos, rgb(.95,.25,.25));
+            ufo.velocity = vec2(0, 0);
+            ufo.showPoints = 60;
+            sfxUFO.play(ufo.pos);
+            continue;
+        }
 
         // vs aliens
         for (const a of aliens)
@@ -624,9 +765,11 @@ function updateCollisions()
 
             b.destroy();
             a.flash = 6;
+            createExplosion(a.pos, a.color);
             a.destroy();
             score += 10;
             hiScore = max(hiScore, score);
+            checkBonusLife();
             sfxExplode.play(a.pos);
             break;
         }
@@ -688,6 +831,7 @@ function updateCollisions()
 function loseLife()
 {
     lives--;
+    createExplosion(player.pos, rgb(.2,.9,.95), 20);
     sfxLoseLife.play(player.pos);
 
     // brief "respawn" by moving player to center and clearing bullets near bottom
@@ -706,7 +850,18 @@ function doGameOver()
 {
     if (gameOver) return;
     gameOver = true;
+    createExplosion(player.pos, rgb(.2,.9,.95), 25);
     sfxExplode.play(player.pos);
+}
+
+function checkBonusLife()
+{
+    if (score >= nextBonusLife)
+    {
+        lives++;
+        nextBonusLife += 1500; // Next bonus at +1500 points
+        sfxBonusLife.play(player.pos);
+    }
 }
 
 function cleanupArrays()
