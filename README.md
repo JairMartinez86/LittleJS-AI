@@ -27,12 +27,12 @@ LittleJS and everything in this repository is **MIT licensed!** See [LICENSE](LI
 |------|------|
 | Tetris | [Play](https://killedbyapixel.github.io/LittleJS-AI/games/tetris.html) |
 | Space Invaders | [Play](https://killedbyapixel.github.io/LittleJS-AI/games/spaceInvaders.html) |
+| Mini Golf | [Play](https://killedbyapixel.github.io/LittleJS-AI/games/miniGolf.html) |
+| Missile Command | [Play](https://killedbyapixel.github.io/LittleJS-AI/games/missileCommand.html) |
 | Snood | [Play](https://killedbyapixel.github.io/LittleJS-AI/games/snood.html) |
 | Asteroids | [Play](https://killedbyapixel.github.io/LittleJS-AI/games/asteroids.html) |
-| Missile Command | [Play](https://killedbyapixel.github.io/LittleJS-AI/games/missileCommand.html) |
 | Minesweeper | [Play](https://killedbyapixel.github.io/LittleJS-AI/games/minesweeper.html) |
 | Breakout | [Play](https://killedbyapixel.github.io/LittleJS-AI/games/breakout.html) |
-| Mini Golf | [Play](https://killedbyapixel.github.io/LittleJS-AI/games/miniGolf.html) |
 | Flappy Bird | [Play](https://killedbyapixel.github.io/LittleJS-AI/games/flappyBird.html) |
 | Centipede | [Play](https://killedbyapixel.github.io/LittleJS-AI/games/centipede.html) |
 | Columns | [Play](https://killedbyapixel.github.io/LittleJS-AI/games/columns.html) |
@@ -48,4 +48,3 @@ LittleJS and everything in this repository is **MIT licensed!** See [LICENSE](LI
 | River Raid | [Play](https://killedbyapixel.github.io/LittleJS-AI/games/riverRaid.html) |
 | Robotron | [Play](https://killedbyapixel.github.io/LittleJS-AI/games/robotron.html) |
 | Snake | [Play](https://killedbyapixel.github.io/LittleJS-AI/games/snake.html) |
-
