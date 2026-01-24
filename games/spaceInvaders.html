@@ -168,10 +168,10 @@ function resetInvaderState(resetSpeed = true)
     if (resetSpeed)
         invaderSpeed = .06 + (currentLevel - 1) * .01;
     
-    // Reset shooting timers
+    // Reset shooting timers (doubled for slower firing)
     const levelShootBonus = (currentLevel - 1) * 2;
-    alienShootMin = max(3, 6 - levelShootBonus);
-    alienShootMax = max(10, 20 - levelShootBonus * 2);
+    alienShootMin = max(6, 12 - levelShootBonus);
+    alienShootMax = max(20, 40 - levelShootBonus * 2);
     alienShootTimer = 60; // 1 second delay before enemies shoot
     
     // Reset march
