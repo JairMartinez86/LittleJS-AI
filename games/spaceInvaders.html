@@ -70,6 +70,9 @@ let gameWin = false;
 let titleScreen = true;
 let titleAliens = [];
 let levelAnnounce = 0; // frames to show level announcement
+let respawnTimer = 0; // frames to wait before respawning
+let playerHidden = false; // true when player is dead and waiting to respawn
+let gameOverTimer = 0; // frames before can click to return to title
 let titleTimer = 0;
 
 let invaderDir = 1;
@@ -239,7 +242,7 @@ class Player extends RectObject
     }
     update()
     {
-        if (gameOver || gameWin || levelAnnounce > 0)
+        if (gameOver || gameWin || levelAnnounce > 0 || respawnTimer > 0)
             return;
 
         // left/right move (no dt; fixed 60fps)
@@ -268,6 +271,10 @@ class Player extends RectObject
     
     render()
     {
+        // Don't draw if hidden (dead, waiting to respawn)
+        if (playerHidden)
+            return;
+        
         // Classic player ship sprite
         const p = this.pos;
         const s = .22;
@@ -296,6 +303,7 @@ class Alien extends RectObject
         this.renderOrder = 5;
         this.flash = 0;
         this.animOffset = randIntInclusive(0, 15); // stagger animation per alien
+        this.originalPos = pos.copy(); // store spawn position for reset
     }
     render()
     {
@@ -425,7 +433,7 @@ class Bomb extends RectObject
 {
     constructor(pos)
     {
-        super(pos, vec2(.3, 1.0), rgb(.95,.95,.95));
+        super(pos, vec2(.5, 1.6), rgb(.95,.95,.2)); // Larger, yellow for visibility
         this.vel = vec2(0, -0.32);
         this.renderOrder = 20;
         this.animTick = 0;
@@ -443,12 +451,12 @@ class Bomb extends RectObject
     
     render()
     {
-        // Animated bomb - squiggly effect
+        // Animated bomb - squiggly effect (larger)
         const frame = (this.animTick >> 2) % 4;
-        const offset = [-.15, -.05, .05, .15][frame];
-        drawRect(this.pos.add(vec2(offset, .3)), vec2(.25, .3), this.color);
-        drawRect(this.pos.add(vec2(-offset, 0)), vec2(.25, .3), this.color);
-        drawRect(this.pos.add(vec2(offset, -.3)), vec2(.25, .3), this.color);
+        const offset = [-.2, -.07, .07, .2][frame];
+        drawRect(this.pos.add(vec2(offset, .5)), vec2(.4, .5), this.color);
+        drawRect(this.pos.add(vec2(-offset, 0)), vec2(.4, .5), this.color);
+        drawRect(this.pos.add(vec2(offset, -.5)), vec2(.4, .5), this.color);
     }
 }
 
@@ -639,19 +647,28 @@ function gameUpdate()
         return;
     }
     
-    // restart (Enter or Click)
-    if ((gameOver || gameWin) && (keyWasPressed('Enter') || mouseWasPressed(0)))
+    // restart (Enter or Click) - game over goes to title, win restarts
+    if (gameOver && gameOverTimer <= 0 && (keyWasPressed('Enter') || mouseWasPressed(0)))
+    {
+        // Go to title screen
+        engineObjectsDestroy(true);
+        aliens.length = 0;
+        bullets.length = 0;
+        bombs.length = 0;
+        barriers.length = 0;
+        ufo = null;
+        player = null;
+        levelAnnounce = 0;
+        respawnTimer = 0;
+        playerHidden = false;
+        gameOverTimer = 0;
+        initTitleScreen();
+        return;
+    }
+    if (gameWin && (keyWasPressed('Enter') || mouseWasPressed(0)))
         resetGame();
     
-    // Level announcement pause
-    if (levelAnnounce > 0)
-    {
-        levelAnnounce--;
-        invaderAnimTick++; // Keep aliens animating
-        return; // Don't update gameplay during announcement
-    }
-    
-    // Return to title screen with Escape
+    // Return to title screen with Escape (works anytime including during level announcement)
     if (keyWasPressed('Escape'))
     {
         // Clean up game objects
@@ -662,14 +679,40 @@ function gameUpdate()
         barriers.length = 0;
         ufo = null;
         player = null;
+        levelAnnounce = 0;
+        respawnTimer = 0;
+        playerHidden = false;
         initTitleScreen();
+        return;
+    }
+    
+    // Level announcement pause
+    if (levelAnnounce > 0)
+    {
+        levelAnnounce--;
+        invaderAnimTick++; // Keep aliens animating
+        return; // Don't update gameplay during announcement
+    }
+    
+    // Respawn timer - wait before respawning after death
+    if (respawnTimer > 0)
+    {
+        respawnTimer--;
+        invaderAnimTick++; // Keep aliens animating
+        if (respawnTimer === 0)
+        {
+            doRespawn();
+        }
         return;
     }
 
     invaderAnimTick++;
 
     if (gameOver || gameWin)
+    {
+        if (gameOverTimer > 0) gameOverTimer--;
         return;
+    }
 
     updateInvaders();
     updateUFO();
@@ -714,7 +757,7 @@ function gameRender()
     drawRect(cameraPos, levelSize, rgb(0,0,0));
 
     // Red floor line right below the player
-    drawRect(vec2(levelSize.x/2, playerY - 0.8), vec2(levelSize.x, .15), rgb(.95,.25,.25));
+    drawRect(vec2(levelSize.x/2, playerY - 0.8), vec2(levelSize.x, .15), rgb(1, 0, 0));
 }
 
 function gameRenderPost()
@@ -753,8 +796,8 @@ function gameRenderPost()
         mainContext.fillRect(px + 10, py + 2, 6, 4); // right wing
     }
     
-    // Level indicator at bottom right
-    drawTextScreen(`LEVEL ${currentLevel}`, vec2(mainCanvasSize.x - 80, livesY), 26, color);
+    // Level indicator at bottom right (cyan like player)
+    drawTextScreen(`LEVEL ${currentLevel}`, vec2(mainCanvasSize.x - 80, livesY + 3), 26, rgb(.2,.9,.95));
 
     // Level announcement
     if (levelAnnounce > 0)
@@ -771,7 +814,6 @@ function gameRenderPost()
     if (gameOver)
     {
         drawTextScreen('GAME OVER', vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 - 20), 80, rgb(.95,.25,.25), 8, rgb(0,0,0));
-        drawTextScreen('Click to Restart', vec2(mainCanvasSize.x/2, mainCanvasSize.y/2 + 45), 34, rgb(.95,.95,.95), 6, rgb(0,0,0));
     }
     else if (gameWin)
     {
@@ -800,6 +842,13 @@ function renderTitleScreen()
         ctx.fillRect(sx, sy, 2, 2);
     }
     
+    // Planet ring (back half - drawn before planet)
+    ctx.strokeStyle = '#96c896';
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.ellipse(w * 0.8, h * 0.55, 110, 25, -0.3, PI, PI * 2); // back arc
+    ctx.stroke();
+    
     // Planet in background (right side)
     const gradient = ctx.createRadialGradient(w * 0.8, h * 0.55, 0, w * 0.8, h * 0.55, 100);
     gradient.addColorStop(0, '#4a6');
@@ -810,11 +859,11 @@ function renderTitleScreen()
     ctx.arc(w * 0.8, h * 0.55, 80, 0, PI * 2);
     ctx.fill();
     
-    // Planet ring
-    ctx.strokeStyle = 'rgba(150,200,150,0.4)';
+    // Planet ring (front half - drawn after planet)
+    ctx.strokeStyle = '#96c896';
     ctx.lineWidth = 6;
     ctx.beginPath();
-    ctx.ellipse(w * 0.8, h * 0.55, 110, 25, -0.3, 0, PI * 2);
+    ctx.ellipse(w * 0.8, h * 0.55, 110, 25, -0.3, 0, PI); // front arc
     ctx.stroke();
     
     // Player ship in foreground (large, bottom left)
@@ -864,6 +913,11 @@ function renderTitleScreen()
         ctx.font = 'bold 32px Arial';
         ctx.fillText('CLICK TO START', w/2, h - 50);
     }
+    
+    // Made with LittleJS credit
+    ctx.fillStyle = '#888';
+    ctx.font = '16px Arial';
+    ctx.fillText('Made with LittleJS', w/2, h - 15);
 }
 
 // ------------------------------------------------------------
@@ -1097,11 +1151,37 @@ function loseLife()
         return;
     }
 
-    // Clear all projectiles but keep barriers and aliens as they are
+    // Clear all projectiles
     for (const b of bullets) b.destroy();
     for (const bomb of bombs) bomb.destroy();
     bullets.length = 0;
     bombs.length = 0;
+    
+    // Destroy UFO if present
+    if (ufo && !ufo.destroyed)
+    {
+        ufo.destroy();
+        ufo = null;
+    }
+    
+    // Hide player during respawn wait (don't move them, just hide)
+    playerHidden = true;
+    
+    // Start respawn timer (2 seconds = 120 frames)
+    respawnTimer = 120;
+}
+
+function doRespawn()
+{
+    // Reset UFO timer
+    ufoSpawnTimer = randIntInclusive(300, 600);
+    
+    // Reset all remaining aliens to their original spawn positions
+    for (const a of aliens)
+    {
+        if (!a.destroyed)
+            a.pos = a.originalPos.copy();
+    }
     
     // Reset invader movement state but DON'T respawn them
     invaderDir = 1;
@@ -1120,12 +1200,17 @@ function loseLife()
     // Respawn player at center
     player.pos = vec2(levelSize.x/2, playerY);
     player.cooldown = 30; // brief cooldown
+    playerHidden = false; // show player again
+    
+    // Show level announcement again (player must wait before shooting)
+    levelAnnounce = 120;
 }
 
 function doGameOver()
 {
     if (gameOver) return;
     gameOver = true;
+    gameOverTimer = 120; // 2 second delay before can click
     createExplosion(player.pos, rgb(.2,.9,.95), 25);
     sfxExplode.play(player.pos);
 }
